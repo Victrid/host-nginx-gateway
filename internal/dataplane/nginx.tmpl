@@ -1,0 +1,48 @@
+# Managed by HostNginxGateway. Do not edit by hand -- next sync will overwrite.
+{{- if .ErrorLog }}
+error_log {{ .ErrorLog }};
+{{- end }}
+{{- range .Maps }}
+
+map {{ .Source }} ${{ .Name }} {
+{{- range .Entries }}
+    {{ mapKey .Key }} {{ mapValue .Value }};
+{{- end }}
+}
+{{- end }}
+{{- range .SplitClients }}
+
+split_clients {{ .Source }} ${{ .Name }} {
+{{- range .Entries }}
+    {{ splitKey .Percent }} {{ mapValue .Value }};
+{{- end }}
+}
+{{- end }}
+
+{{- range .Upstreams }}
+
+upstream {{ .Name }} {
+    zone {{ .Name }} 64k;
+{{- range .Endpoints }}
+    server {{ .IP }}:{{ .Port }}{{ if .Weight }} weight={{ .Weight }}{{ end }}{{ if not .Ready }} down{{ end }};
+{{- end }}
+}
+{{- end }}
+
+{{- range .Servers }}
+
+server {
+{{- range .Listens }}
+    {{ buildListen . }}
+{{- end }}
+    server_name {{ buildServerName .Hostname }};
+{{- if .TLSCert }}
+    {{ buildTLS .TLSCert }}
+{{- end }}
+{{- range .Locations }}
+    location {{ .Path }} {
+{{ buildLocation . }}
+    }
+{{- end }}
+}
+{{- end }}

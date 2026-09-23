@@ -1,0 +1,14 @@
+# Build artifacts
+/host-nginx-gateway
+*.tar
+*.log
+
+# Test / e2e run products (regenerated per run; BASELINE.md is the record)
+e2e/conformance/report.yaml
+
+# Go
+/vendor/
+
+# Local env
+.env
+.*.swp
