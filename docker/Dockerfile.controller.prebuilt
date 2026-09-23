@@ -1,0 +1,25 @@
+# Prebuilt variant of docker/Dockerfile.controller for no-network /
+# no-registry environments (used by e2e/run-daemonset.sh): the binary is
+# built on the host (warm module cache) and only the runtime layer is
+# assembled here. Image contents are identical to the canonical multi-stage
+# build — alpine + util-linux (nsenter) + ca-certificates + the controller.
+#
+#   CGO_ENABLED=0 go build -o build/host-nginx-gateway ./cmd/host-nginx-gateway
+#   docker build -f docker/Dockerfile.controller.prebuilt \
+#     -t host-nginx-gateway:v0 docker/   # context must contain the binary
+FROM alpine:3.22
+# APK_MIRROR: optional base URL of an Alpine mirror (e.g.
+# https://mirrors.tuna.tsinghua.edu.cn/alpine). When set, packages come from
+# the mirror instead of dl-cdn.alpinelinux.org, whose connections can hang
+# indefinitely on constrained networks (observed stalling DS e2e builds).
+ARG APK_MIRROR=""
+RUN if [ -n "$APK_MIRROR" ]; then \
+        apk add --no-cache -X "$APK_MIRROR/v3.22/main" -X "$APK_MIRROR/v3.22/community" util-linux ca-certificates; \
+    else \
+        apk add --no-cache util-linux ca-certificates; \
+    fi
+COPY host-nginx-gateway /usr/local/bin/host-nginx-gateway
+# No USER here: the DaemonSet form must write the host's /etc/nginx/conf.d
+# and signal the root nginx master (uid 0 + tight securityContext in the
+# chart). See charts/host-nginx-gateway/README.md.
+ENTRYPOINT ["/usr/local/bin/host-nginx-gateway"]

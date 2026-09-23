@@ -1,0 +1,32 @@
+# Controller image for the DaemonSet deployment form (DESIGN.md §8.1).
+#
+# Requirements beyond the static binary:
+#   * nsenter (util-linux) — every nginx -t / nginx -s reload is executed in
+#     the HOST's mount namespace via `nsenter -t 1 -m --` (see
+#     internal/dataplane/exec.go);
+#   * ca-certificates — in-cluster API server TLS.
+#
+# Build: docker build -f docker/Dockerfile.controller -t host-nginx-gateway:v0 .
+# (For a no-registry k3s import see e2e/README.md.)
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+# GOPROXY is overridable at build time (e.g. --build-arg GOPROXY=https://goproxy.cn,direct
+# for networks where proxy.golang.org is unreachable).
+ARG GOPROXY=
+ENV GOPROXY=${GOPROXY}
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/host-nginx-gateway ./cmd/host-nginx-gateway
+
+FROM alpine:3.22
+RUN apk add --no-cache util-linux ca-certificates
+COPY --from=build /out/host-nginx-gateway /usr/local/bin/host-nginx-gateway
+# No USER here: the DaemonSet form must write the host's /etc/nginx/conf.d
+# and signal the root nginx master, so the chart runs the pod as uid 0 with
+# a tight securityContext (privileged, or [SYS_ADMIN, SYS_PTRACE, KILL]).
+ENTRYPOINT ["/usr/local/bin/host-nginx-gateway"]

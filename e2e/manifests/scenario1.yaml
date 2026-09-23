@@ -1,0 +1,38 @@
+# Scenario 1: baseline coexistence (DESIGN.md §2 / §10.4).
+# Apply while the user's nginx.conf has NO k8s-gw include.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: host-nginx
+spec:
+  controllerName: gateway.host-nginx/controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main
+  namespace: e2e
+spec:
+  gatewayClassName: host-nginx
+  listeners:
+    - name: web
+      port: 8080
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend
+  namespace: e2e
+spec:
+  parentRefs:
+    - name: main
+  hostnames: ["app.example.com"]
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: backend
+          port: 8080

@@ -1,0 +1,21 @@
+host-nginx-gateway {{ .Chart.Version }} installed as a DaemonSet in namespace
+{{ .Release.Namespace }}.
+
+The controller pod:
+  * connects with its in-cluster ServiceAccount ({{ include "host-nginx-gateway.serviceAccountName" . }}),
+  * writes generated config under {{ .Values.nginx.confDir }}/conf.d/k8s-gw (hostPath),
+  * validates/reloads the HOST nginx via `nsenter -t 1 -m` (host mount namespace).
+
+REQUIRED host-side step (DESIGN.md §2 — the controller never edits your nginx.conf):
+
+    http {
+        include {{ .Values.nginx.confDir }}/conf.d/k8s-gw/*.conf;
+        ...
+    }
+
+then `nginx -s reload` once. Until then every Gateway reports
+Accepted=False (Invalid) with this hint in its status message.
+
+WARNING: run at most ONE controller instance per host — two writers on the
+same owned directory would reload the host nginx against each other's
+state.
