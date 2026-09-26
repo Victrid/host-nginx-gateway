@@ -1,0 +1,23 @@
+apiVersion: v1
+entries:
+  host-nginx-gateway:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-09-26T12:03:25.742017986Z"
+    description: 'Kubernetes Gateway API controller that configures a HOST-local nginx
+      (co-existing with the operator''s own nginx.conf). DaemonSet form: the controller
+      runs as a privileged pod per node and drives the host''s nginx binary via nsenter
+      (DESIGN.md §8.1). '
+    digest: 7ab7ffd644e83e014a038bd2d5bb23474fc050fd81dc6da3bb979931cab8aee6
+    home: https://github.com/Victrid/HostNginxGateway
+    keywords:
+    - gateway-api
+    - nginx
+    maintainers:
+    - name: HostNginxGateway maintainers
+    name: host-nginx-gateway
+    type: application
+    urls:
+    - https://github.com/Victrid/host-nginx-gateway/releases/download/host-nginx-gateway-0.1.0/host-nginx-gateway-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-09-26T12:03:25.742024629Z"
