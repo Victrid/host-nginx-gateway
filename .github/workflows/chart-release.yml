@@ -21,6 +21,21 @@ jobs:
           git config user.name "$GITHUB_ACTOR"
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
+      - name: Ensure gh-pages ref is available
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --no-tags origin gh-pages:refs/remotes/origin/gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+            touch .nojekyll
+            git add .nojekyll
+            git commit -m "chore: initialize gh-pages branch"
+            git push origin gh-pages
+            git checkout "${GITHUB_SHA}"
+            git fetch --no-tags origin gh-pages:refs/remotes/origin/gh-pages
+          fi
+
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.7.0
         env:
