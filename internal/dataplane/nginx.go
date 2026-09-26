@@ -38,7 +38,7 @@ type NginxConfig struct {
 	// Binary is the path to the nginx executable (DESIGN.md §5.4 / N5).
 	// Defaults to "/usr/sbin/nginx" when empty. In nsenter (DaemonSet)
 	// mode this is the HOST's nginx path — the wrapper re-enters the host
-	// mount namespace before exec (see exec.go).
+	// network + mount namespaces before exec (see exec.go).
 	Binary string
 	// PIDFile is the path to nginx's pid file (DESIGN.md §6).
 	// Defaults to "/run/nginx.pid" when empty. In the DaemonSet form the

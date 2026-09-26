@@ -245,7 +245,6 @@ K rollout status deploy/backend --timeout=180s >/dev/null
 
 # ---------------------------------------------------------------------------
 log "scenario DS-3: port change proves the POD reloads the HOST nginx"
-BEFORE=$(sudo stat -c %Y "$CONF_DIR/00-global.conf" 2>/dev/null || echo 0)
 K patch gateway main --type=json -p='[{"op":"replace","path":"/spec/listeners/0/port","value":8082}]' >/dev/null
 kick main
 wait_until "port 8082 bound by host nginx" 90 "ss -tln | grep -q ':8082 '"
@@ -253,8 +252,13 @@ ss -tln | grep -q ':8082 ' && ok "DS-3 new port 8082 bound" || bad "DS-3 8082 no
 ss -tln | grep -q ':8080 ' && bad "DS-3 old port 8080 still bound" || ok "DS-3 old port 8080 gone"
 BODY=$(curl -sf -m 5 -H 'Host: ds.example.com' http://127.0.0.1:8082/ds3 2>/dev/null || true)
 [ "$BODY" = "hng-e2e-backend /ds3" ] && ok "DS-3 traffic follows the new port" || bad "DS-3 curl: '$BODY'"
-AFTER=$(sudo stat -c %Y "$CONF_DIR/00-global.conf" 2>/dev/null || echo 0)
-[ "$AFTER" != "$BEFORE" ] && ok "DS-3 config file rewritten by the pod" || bad "DS-3 config file untouched"
+# content, not mtime: the DS-2 recovery publish and this rewrite can land in
+# the same wall second, so second-granularity mtimes compare equal (flake);
+# asserting the rendered directive proves the rewrite directly
+wait_until "00-global.conf carries the new port" 10 \
+  "sudo grep -q 'listen 8082;' '$CONF_DIR/00-global.conf'" \
+  && ok "DS-3 config file rewritten by the pod (listen 8082)" \
+  || bad "DS-3 config file lacks 'listen 8082;'"
 
 # ---------------------------------------------------------------------------
 log "cleanup"

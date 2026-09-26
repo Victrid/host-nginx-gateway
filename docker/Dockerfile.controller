@@ -2,7 +2,7 @@
 #
 # Requirements beyond the static binary:
 #   * nsenter (util-linux) — every nginx -t / nginx -s reload is executed in
-#     the HOST's mount namespace via `nsenter -t 1 -m --` (see
+#     the HOST's network + mount namespaces via `nsenter -t 1 -n -m --` (see
 #     internal/dataplane/exec.go);
 #   * ca-certificates — in-cluster API server TLS.
 #

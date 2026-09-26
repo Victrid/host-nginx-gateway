@@ -17,7 +17,10 @@ This project is not affiliated with nginx or Kubernetes.
 > **One Controller per Node**:  The controller claims `/etc/nginx/conf.d/k8s-gw/` exclusively; do not run two instances against the same nginx. Using DaemonSet can guarantee this. 
 
 ## Quick Start
-
+```bash
+# Install Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+```
 Full Helm values are documented in [charts/host-nginx-gateway/README.md](charts/host-nginx-gateway/README.md).
 
 ## Prerequisites

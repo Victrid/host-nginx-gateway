@@ -2,7 +2,12 @@
 // `nginx -s reload` exits 0 even when the NEW workers fail their binds and
 // the master silently keeps serving the previous configuration. After a
 // reload that adds listen sockets, the publisher tails the error log for
-// bind failures and rolls back when one appears.
+// bind failures and rolls back when one appears — EXCEPT EADDRINUSE (98)
+// lines for sockets the previously-applied config already listens on: the
+// running master hands those over via inherited-fd reuse, so they do not
+// mean the reload was rejected (the nsenter -n fix makes exactly those
+// lines observable, since `nginx -t`/reload now run against the host's
+// real addresses and ports). Unassignable addresses (99) always roll back.
 package dataplane
 
 import (
@@ -79,6 +84,8 @@ func TestPublisher_VerifyReloadDetectsBindFailureAndRollsBack(t *testing.T) {
 
 	// Second publish adds a NEW listen (8081); the reload is signalled OK
 	// but the bind fails → verification must catch it and roll back.
+	// (EADDRINUSE on a genuinely NEW socket — e.g. a foreign process holds
+	// 8081 — is a real rejection, unlike 98 on a master-held socket below.)
 	_, err = pub.Publish(context.Background(), "default_app", cfgWithListen(8081))
 	if !errors.Is(err, ErrReload) {
 		t.Fatalf("bind failure must surface as ErrReload, got %v", err)
@@ -212,15 +219,140 @@ func TestPublisher_MissingErrorLogSkipsVerification(t *testing.T) {
 }
 
 func TestFindBindFailure(t *testing.T) {
-	data := "start\n2026/09/23 [emerg] bind() to 0.0.0.0:443 failed (98: Address already in use)\n"
-	line, ok := findBindFailure([]byte(data))
-	if !ok || !strings.Contains(line, "0.0.0.0:443") {
-		t.Fatalf("bind failure line not found: %q %v", line, ok)
+	inUse := "start\n2026/09/23 [emerg] bind() to 0.0.0.0:443 failed (98: Address already in use)\n"
+	// EADDRINUSE (98) on a socket the previously-applied config holds is
+	// benign — the running master hands the socket over on reload.
+	held := socketTextForms([]string{":443"})
+	if line, ok := findBindFailure([]byte(inUse), held); ok {
+		t.Fatalf("98 on a held socket must be tolerated, got %q", line)
 	}
-	if _, ok := findBindFailure([]byte("all fine\nupstream ready\n")); ok {
+	// The same line is a rejection when no config holds the socket (foreign
+	// holder, or the very first publish).
+	if _, ok := findBindFailure([]byte(inUse), nil); !ok {
+		t.Fatal("98 on a non-held socket must fail")
+	}
+	// Unassignable addresses (99) fail even when the address is held.
+	nine9 := "2026/09/23 [emerg] bind() to [2001:db8::1]:443 failed (99: Cannot assign requested address)\n"
+	line, ok := findBindFailure([]byte(nine9), socketTextForms([]string{"[2001:db8::1]:443"}))
+	if !ok || !strings.Contains(line, "99: Cannot assign requested address") {
+		t.Fatalf("unassignable address must fail even when held: %q %v", line, ok)
+	}
+	if _, ok := findBindFailure([]byte("all fine\nupstream ready\n"), nil); ok {
 		t.Fatal("false positive on clean log")
 	}
-	if _, ok := findBindFailure(nil); ok {
+	if _, ok := findBindFailure(nil, nil); ok {
 		t.Fatal("empty log must not trip")
+	}
+}
+
+func TestSocketTextForms(t *testing.T) {
+	got := socketTextForms([]string{":8080", "0.0.0.0:8081", "[::]:8082", "192.168.1.10:8083"})
+	want := map[string]struct{}{
+		"0.0.0.0:8080":      {},
+		"*:8080":            {},
+		"0.0.0.0:8081":      {},
+		"*:8081":            {},
+		"[::]:8082":         {},
+		"192.168.1.10:8083": {},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("socketTextForms = %v, want %v", got, want)
+	}
+	for k := range want {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("socketTextForms missing %q: %v", k, got)
+		}
+	}
+	if socketTextForms(nil) != nil {
+		t.Fatal("nil keys must map to nil")
+	}
+}
+
+// TestPublisher_VerifyToleratesEADDRINUSEOnHeldSockets: a reload that adds a
+// new socket (8081) while KEEPING an existing one (8080) must not be rolled
+// back because the log shows `bind() to 0.0.0.0:8080 failed (98 …)` for the
+// socket the master already holds — nginx hands held sockets over on reload
+// (inherited-fd reuse), so that line is noise, not a rejection.
+func TestPublisher_VerifyToleratesEADDRINUSEOnHeldSockets(t *testing.T) {
+	val, tmp := newValidatorForTest(t)
+	dir := filepath.Join(tmp, "out")
+	logPath := filepath.Join(tmp, "error.log")
+	if err := os.WriteFile(logPath, []byte("old line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nginx := &bindFailNginxClient{
+		logPath:        logPath,
+		logLine:        `2026/09/23 10:00:00 [emerg] 123#123: bind() to 0.0.0.0:8080 failed (98: Address already in use)`,
+		appendOnReload: 2, // the second reload call = the verified new-listen one
+	}
+	pub, err := NewPublisher(PublisherOptions{
+		OutputDir:         dir,
+		Validator:         val,
+		Nginx:             nginx,
+		ErrorLogPath:      logPath,
+		VerifyReloadDelay: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	twoListens := func() *contract.Configuration {
+		cfg := basicCfg()
+		cfg.Servers[0].Listens = []contract.Listen{{Port: 8080}, {Port: 8081}}
+		return cfg
+	}
+	if _, err := pub.Publish(context.Background(), "default_app", cfgWithListen(8080)); err != nil {
+		t.Fatalf("base publish: %v", err)
+	}
+	res, err := pub.Publish(context.Background(), "default_app", twoListens())
+	if err != nil {
+		t.Fatalf("98 on a master-held socket must not roll back: %v", err)
+	}
+	if !res.Reloaded {
+		t.Fatal("the new-listen publish must be recorded as reloaded")
+	}
+	if _, ok := pub.Applied("default_app"); !ok {
+		t.Fatal("success must be recorded as applied")
+	}
+}
+
+// TestPublisher_VerifyRollsBackOnUnassignableAddress: errno 99
+// (EADDRNOTAVAIL — the address does not exist on the host, e.g. a node-global
+// IPv6 gone missing) is ALWAYS a rejection, held or not.
+func TestPublisher_VerifyRollsBackOnUnassignableAddress(t *testing.T) {
+	val, tmp := newValidatorForTest(t)
+	dir := filepath.Join(tmp, "out")
+	logPath := filepath.Join(tmp, "error.log")
+	if err := os.WriteFile(logPath, []byte("old line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nginx := &bindFailNginxClient{
+		logPath:        logPath,
+		logLine:        `2026/09/23 10:00:00 [emerg] 123#123: bind() to 2001:db8::1:8081 failed (99: Cannot assign requested address)`,
+		appendOnReload: 2,
+	}
+	pub, err := NewPublisher(PublisherOptions{
+		OutputDir:         dir,
+		Validator:         val,
+		Nginx:             nginx,
+		ErrorLogPath:      logPath,
+		VerifyReloadDelay: 400 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	if _, err := pub.Publish(context.Background(), "default_app", cfgWithListen(8080)); err != nil {
+		t.Fatalf("base publish: %v", err)
+	}
+	twoListens := func() *contract.Configuration {
+		cfg := basicCfg()
+		cfg.Servers[0].Listens = []contract.Listen{{Port: 8080}, {Port: 8081}}
+		return cfg
+	}
+	_, err = pub.Publish(context.Background(), "default_app", twoListens())
+	if !errors.Is(err, ErrReload) {
+		t.Fatalf("99 must surface as ErrReload, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "(99: Cannot assign requested address)") {
+		t.Fatalf("the 99 bind error must be in the message: %v", err)
 	}
 }

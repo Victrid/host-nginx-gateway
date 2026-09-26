@@ -15,7 +15,7 @@ http {
 
 | Aspect | Mechanism |
 |---|---|
-| `nginx -t` / `nginx -s reload` | `nsenter -t 1 -m -- /usr/sbin/nginx …` (host mount namespace — the only exec path) |
+| `nginx -t` / `nginx -s reload` | `nsenter -t 1 -n -m -- /usr/sbin/nginx …` (host network + mount namespaces — the only exec path) |
 | Config / certs / temp main config | hostPath `/etc/nginx` (ReadWrite) — same files the host nginx includes |
 | Liveness probe | `/host/run/nginx.pid` via hostPath `/run`→`/host/run` (ReadOnly) + `kill(pid, 0)`; `hostPID: true` |
 | API access | in-cluster ServiceAccount + ClusterRole (least privilege, bundled with the chart) |
@@ -23,9 +23,9 @@ http {
 ## Security
 
 Default `securityContext.privileged: true` — the simplest correct set for
-`nsenter -m` (setns into the host mount namespace requires SYS_ADMIN +
-SYS_PTRACE) plus signaling the root nginx master (root or CAP_KILL). The
-narrower alternative:
+`nsenter -n -m` (setns into the host network and mount namespaces requires
+SYS_ADMIN + SYS_PTRACE) plus signaling the root nginx master (root or
+CAP_KILL). The narrower alternative:
 
 ```yaml
 podSecurityContext:

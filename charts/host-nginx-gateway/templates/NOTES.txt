@@ -4,7 +4,8 @@ host-nginx-gateway {{ .Chart.Version }} installed as a DaemonSet in namespace
 The controller pod:
   * connects with its in-cluster ServiceAccount ({{ include "host-nginx-gateway.serviceAccountName" . }}),
   * writes generated config under {{ .Values.nginx.confDir }}/conf.d/k8s-gw (hostPath),
-  * validates/reloads the HOST nginx via `nsenter -t 1 -m` (host mount namespace).
+  * validates/reloads the HOST nginx via `nsenter -t 1 -n -m` (host network +
+    mount namespaces).
 
 REQUIRED host-side step (DESIGN.md §2 — the controller never edits your nginx.conf):
 

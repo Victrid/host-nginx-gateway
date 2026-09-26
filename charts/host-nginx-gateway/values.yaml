@@ -3,7 +3,7 @@
 # The controller runs one pod per node (nodeSelector to pin it where the
 # host nginx lives), connects with its in-cluster ServiceAccount (no
 # kubeconfig mount), and drives the HOST nginx through
-# `nsenter -t 1 -m -- /usr/sbin/nginx ...`.
+# `nsenter -t 1 -n -m -- /usr/sbin/nginx ...`.
 #
 # WARNING: run at most ONE controller instance per host — multiple
 # instances (e.g. a second release of this chart, or a manually started
@@ -30,8 +30,8 @@ nginx:
   # pid path is expressed in the POD's view of the filesystem.
   pidPath: /host/run/nginx.pid
   binary: /usr/sbin/nginx
-  # Every nginx invocation runs inside the host mount namespace via
-  # `nsenter -t 1 -m` (the only exec path; see DESIGN.md §8.1).
+  # Every nginx invocation runs inside the host network + mount namespaces
+  # via `nsenter -t 1 -n -m` (the only exec path; see DESIGN.md §8.1).
 
 # -- GatewayClass the controller claims (DESIGN.md §3.3). Must match
 # provider.ControllerName unless you run a renamed build.
@@ -65,7 +65,7 @@ resources: {}
   #   memory: 64Mi
 
 # -- Pod security. Default privileged (simplest correct set for
-# nsenter -m + signaling the root nginx master). The narrower alternative
+# nsenter -n -m + signaling the root nginx master). The narrower alternative
 # is keepCaps [SYS_ADMIN, SYS_PTRACE, KILL] with privileged: false —
 # see charts README "Security".
 podSecurityContext:

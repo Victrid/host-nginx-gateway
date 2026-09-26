@@ -76,7 +76,10 @@ product limitations it documented have since been **fixed in product code**:
 
 * **Reload signal blindness** — `internal/dataplane/publisher.go` now tails
   the owned error log for `bind()` failures after reloads that add listen
-  sockets and rolls back (DESIGN §5.2).
+  sockets and rolls back (DESIGN §5.2). Detection is errno-classified:
+  EADDRINUSE (98) lines for sockets the previously-applied config already
+  listens on are tolerated (the master hands held sockets over on reload),
+  while unassignable addresses (99) and other failures roll back.
 * **Wildcard↔specific same-port listen transitions** — partially mitigated
   by the same verification; changing the port alongside the bind set remains
   the clean path.

@@ -8,9 +8,10 @@ host-nginx-gateway DaemonSet (DESIGN.md §8.1):
                  ServiceAccount token mounts under /run/secrets/... and
                  runc must create that mountpoint — impossible inside a
                  read-only hostPath mounted at /run);
-  nsenter exec — every nginx -t / nginx -s reload runs in the HOST mount
-                 namespace via `nsenter -t 1 -m` (the only exec path), so
-                 validation and reload see exactly what the
+  nsenter exec — every nginx -t / nginx -s reload runs in the HOST network
+                 + mount namespaces via `nsenter -t 1 -n -m` (the only exec
+                 path), so validation sees the host's real addresses and
+                 reload see exactly what the
                  host nginx will load;
   in-cluster   — ServiceAccount token only, no kubeconfig mount.
 */}}

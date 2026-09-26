@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,7 +56,11 @@ type PublisherOptions struct {
 	// publisher watches the log for bind failures — `nginx -s reload`
 	// exits 0 even when the new workers cannot bind and the master keeps
 	// serving the previous configuration ("reload signal blindness",
-	// DESIGN.md §5.2). Empty disables verification.
+	// DESIGN.md §5.2). Empty disables verification. Detection is
+	// errno-classified (see findBindFailure): an EADDRINUSE (98) line for a
+	// socket the previously-applied config already listens on is benign —
+	// the running master hands that socket over on reload — while
+	// unassignable addresses (99) and other bind failures roll back.
 	ErrorLogPath string
 	// VerifyReloadDelay bounds how long the publisher waits for a bind
 	// failure to appear after a reload. Bind failures surface within
@@ -212,7 +217,8 @@ func (p *Publisher) applyRendered(ctx context.Context, name string, rendered []b
 	// 5b. Reload-effect verification (DESIGN.md §5.2): a reload that adds
 	// listen sockets can be REJECTED at bind time while still exiting 0;
 	// the master then keeps serving the previous configuration. Check the
-	// error log for bind failures; on detection run the same rollback.
+	// error log for bind failures (errno-classified — see findBindFailure);
+	// on detection run the same rollback.
 	if err := p.verifyReloadEffect(name, listens, logOffset); err != nil {
 		return Published{}, p.rollback(ctx, name, prevPath, finalPath, hadPrev, err, logOffset, hash)
 	}
@@ -267,8 +273,10 @@ func (p *Publisher) logSize() int64 {
 // verifyReloadEffect watches the error log for bind failures appended after
 // logOffset, for a bounded window (DESIGN.md §5.2). Only a reload that ADDS
 // listen sockets is verified — socket additions are the transitions nginx
-// can reject at bind time. Best-effort: an unreadable/absent log skips the
-// check.
+// can reject at bind time. Sockets held by the previously-applied config are
+// exempt from EADDRINUSE detection: the running master hands them over via
+// inherited-fd reuse (see findBindFailure). Best-effort: an unreadable/absent
+// log skips the check.
 func (p *Publisher) verifyReloadEffect(name string, listens []string, logOffset int64) error {
 	if p.opts.ErrorLogPath == "" || len(listens) == 0 {
 		return nil
@@ -276,11 +284,12 @@ func (p *Publisher) verifyReloadEffect(name string, listens []string, logOffset 
 	if prev, ok := p.appliedListens[name]; ok && sameStrings(prev, listens) {
 		return nil // no new sockets
 	}
+	held := socketTextForms(p.appliedListens[name])
 	deadline := time.Now().Add(p.opts.VerifyReloadDelay)
 	var tail []byte
 	for {
 		tail = readLogTail(p.opts.ErrorLogPath, logOffset)
-		if line, ok := findBindFailure(tail); ok {
+		if line, ok := findBindFailure(tail, held); ok {
 			return fmt.Errorf("reload did not take effect: %s", line)
 		}
 		if time.Now().After(deadline) {
@@ -312,18 +321,63 @@ func readLogTail(path string, offset int64) []byte {
 	return data[:n]
 }
 
-// findBindFailure scans appended log lines for nginx bind rejections
-// (`[emerg] … bind() to … failed …`).
-func findBindFailure(data []byte) (string, bool) {
+// bindFailureRe extracts the address:port text and errno from an nginx
+// bind-failure log line: "bind() to 0.0.0.0:8082 failed (98: Address already
+// in use)".
+var bindFailureRe = regexp.MustCompile(`bind\(\) to (\S+) failed \((\d+):`)
+
+// findBindFailure scans appended log lines for nginx bind rejections that
+// mean THIS reload was rejected (DESIGN.md §5.2). Classification:
+//   - EADDRINUSE (errno 98) on a socket the PREVIOUSLY-APPLIED config already
+//     listens on is benign: the running master holds that socket and hands it
+//     to the new workers via inherited-fd reuse, so the log line does not
+//     imply the new configuration was turned away. Without this exemption a
+//     healthy reload that re-listens existing host addresses would roll back.
+//   - Everything else is a rejection: errno 99 (EADDRNOTAVAIL — the address
+//     does not exist on the host, e.g. a node-global IPv6) or errno 98 on a
+//     genuinely NEW socket (held by a foreign process). Unparseable
+//     "bind() … failed" lines stay conservative failures.
+func findBindFailure(data []byte, held map[string]struct{}) (string, bool) {
 	if len(data) == 0 {
 		return "", false
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, "bind() to") && strings.Contains(line, "failed") {
-			return strings.TrimSpace(line), true
+		if !strings.Contains(line, "bind() to") || !strings.Contains(line, "failed") {
+			continue
 		}
+		if m := bindFailureRe.FindStringSubmatch(line); m != nil && m[2] == "98" {
+			if _, isHeld := held[m[1]]; isHeld {
+				continue // master-held socket: handed over on reload
+			}
+		}
+		return strings.TrimSpace(line), true
 	}
 	return "", false
+}
+
+// socketTextForms converts contract listen keys ("addr:port", the
+// listenKeysOf form) into the address texts nginx prints in bind-failure
+// log lines. The bare `listen <port>` form (Address "" → key ":<port>")
+// binds the IPv4 wildcard, which nginx logs as "0.0.0.0:<port>".
+func socketTextForms(keys []string) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		i := strings.LastIndex(k, ":")
+		if i < 0 {
+			continue
+		}
+		addr, port := k[:i], k[i:]
+		if addr == "" || addr == "0.0.0.0" {
+			out["0.0.0.0"+port] = struct{}{}
+			out["*"+port] = struct{}{} // historical nginx wildcard text
+		} else {
+			out[addr+port] = struct{}{}
+		}
+	}
+	return out
 }
 
 // listenKeysOf flattens a configuration's listen set into "addr:port" keys.

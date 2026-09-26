@@ -16,7 +16,7 @@ func TestNsenterCommanderBuildsHostNamespaceInvocation(t *testing.T) {
 	if cmd.Args[0] != "nsenter" {
 		t.Fatalf("argv[0] = %q, want nsenter", cmd.Args[0])
 	}
-	want := []string{"nsenter", "-t", "1", "-m", "--", "/usr/sbin/nginx", "-t", "-c", "/etc/nginx/x.conf"}
+	want := []string{"nsenter", "-t", "1", "-n", "-m", "--", "/usr/sbin/nginx", "-t", "-c", "/etc/nginx/x.conf"}
 	if len(cmd.Args) != len(want) {
 		t.Fatalf("args = %v, want %v", cmd.Args, want)
 	}
@@ -55,7 +55,7 @@ func TestNginxClientOSCommanderSeam(t *testing.T) {
 		t.Fatalf("reload through commander: %v", err)
 	}
 	nsArgs, _ := os.ReadFile(nsenterLog)
-	if string(nsArgs) != "-t\n7\n-m\n--\n"+dir+"/fake-nginx\n-s\nreload\n" {
+	if string(nsArgs) != "-t\n7\n-n\n-m\n--\n"+dir+"/fake-nginx\n-s\nreload\n" {
 		t.Fatalf("nsenter argv = %q", nsArgs)
 	}
 	nginxArgs, _ := os.ReadFile(nginxLog)

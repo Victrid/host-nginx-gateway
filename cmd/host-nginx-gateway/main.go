@@ -156,9 +156,10 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 	// is therefore a developer convenience only.
 	//
 	// Every nginx invocation (-t validation and -s reload) goes through
-	// `nsenter -t 1 -m --` into the host's mount namespace (DESIGN.md
-	// §8.1 DaemonSet 部署形态) — the Commander seam below is also where
-	// tests inject fakes.
+	// `nsenter -t 1 -n -m --` into the host's network + mount namespaces
+	// (DESIGN.md §8.1 DaemonSet 部署形态) — -n so `nginx -t` sees the HOST's
+	// addresses when probing `listen` directives. The Commander seam below
+	// is also where tests inject fakes.
 	if _, err := exec.LookPath("nsenter"); err != nil {
 		return fmt.Errorf("the controller requires the nsenter binary (util-linux) in the image: %w", err)
 	}
