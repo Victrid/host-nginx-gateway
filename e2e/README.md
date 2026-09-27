@@ -15,6 +15,18 @@ adaptations (loopback bind + status.address shims).
 
 k3s is NOT preinstalled here; it was installed locally for the test:
 
+> **Default-server fixture (round 9):** the controller never injects
+> default servers (DESIGN.md §3.3) — unmatched hosts follow nginx's own
+> default-server rules, owned by the host administrator. This test machine
+> fills that role with a script-managed fixture:
+> `e2e/install-default-server-fixture.sh` (invoked by both runner scripts,
+> idempotent) writes `/etc/nginx/conf.d/k8s-gw-default-fixture.conf`
+> (404 for unmatched Host/SNI on 80/443, wildcard + the controller's whole
+> loopback auto-assignment pool 127.0.0.8–127.0.0.239) and includes it
+> from `/etc/nginx/nginx.conf`. It is environment setup, NOT controller
+> output — the controller never writes it and never writes outside
+> `conf.d/k8s-gw/`.
+
 ```sh
 # 1. k3s binary from the Tsinghua mirror (no GitHub access needed):
 curl -fsSL -o /tmp/opencode/k3s \

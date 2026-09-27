@@ -5,8 +5,8 @@
 //
 //   - a request whose Host matches a more-specific route WITHOUT a matching
 //     path must fall through to a broader-hostname route that does;
-//   - hosts that no route claims must not leak into any route (the socket's
-//     default server answers 404);
+//   - hosts that no route claims get NO controller-emitted block: default
+//     servers belong to the host administrator's nginx.conf;
 //   - a hostname-less route attached to a hostname-less listener is the
 //     legitimate catch-all and matches every host.
 package provider
@@ -70,19 +70,24 @@ func TestGEP722_WildcardBlockUnchanged(t *testing.T) {
 	}
 }
 
-func TestGEP722_UnmatchedHostsDoNotLeak(t *testing.T) {
+func TestGEP722_NoBlockForUnclaimedHosts(t *testing.T) {
 	cfg := fallThroughGraph(t)
 	servers := serversByHostname(t, cfg)
-	// Synthetic default block: empty (404), listed first for the socket.
-	dflt, ok := servers[""]
-	if !ok {
-		t.Fatalf("synthetic default block missing: %+v", cfg.Servers)
+	// Only the two route-backed blocks exist: the controller emits no
+	// synthetic default block for hosts no route claims — default servers
+	// belong to the host administrator's nginx.conf (nginx then applies
+	// its own default-server rules, e.g. the first block on the socket).
+	want := map[string]bool{"very.specific.com": true, "*.specific.com": true}
+	if len(cfg.Servers) != len(want) {
+		t.Fatalf("route-backed blocks only: want %v, got %+v", want, cfg.Servers)
 	}
-	if len(dflt.Locations) != 0 {
-		t.Fatalf("unmatched hosts must not reach any route location: %+v", dflt.Locations)
+	for _, s := range cfg.Servers {
+		if !want[s.Hostname] {
+			t.Fatalf("block %q is not backed by any route claim: %+v", s.Hostname, s)
+		}
 	}
-	if cfg.Servers[0].Hostname != "" {
-		t.Fatalf("default server must be listed first: %+v", cfg.Servers[0])
+	if _, has := servers[""]; has {
+		t.Fatalf("synthetic default block must not be emitted: %+v", cfg.Servers)
 	}
 }
 

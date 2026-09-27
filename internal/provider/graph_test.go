@@ -166,11 +166,11 @@ func TestConflicts_SameGateway(t *testing.T) {
 			t.Fatalf("listener %q reason=%q, want HostnameConflict", name, li.ConflictReason)
 		}
 	}
-	// Conflicted listeners must not produce server blocks. The two valid
-	// listeners each emit a named block plus a synthetic default block.
+	// Conflicted listeners must not produce server blocks; the two valid
+	// listeners each emit their named block (no synthetic default).
 	cfg := g.Configuration()
-	if len(cfg.Servers) != 4 {
-		t.Fatalf("expected 4 servers (default+d, default+e), got %d", len(cfg.Servers))
+	if len(cfg.Servers) != 2 {
+		t.Fatalf("expected 2 servers (d, e), got %d", len(cfg.Servers))
 	}
 }
 
@@ -230,8 +230,8 @@ func TestConflicts_CrossGateway(t *testing.T) {
 	if addrs["gw1"] != "127.0.0."+fmt.Sprint(autoAssignBase+int(fnv32a("default/gw1"))%autoAssignSpan) {
 		t.Fatalf("assignment must be the stable hash candidate, got %s", addrs["gw1"])
 	}
-	// Both gateways program: per gateway a default block plus its named block.
-	if servers := g.Configuration().Servers; len(servers) != 4 {
+	// Both gateways program: per gateway its named block.
+	if servers := g.Configuration().Servers; len(servers) != 2 {
 		t.Fatalf("cross-gateway indistinct listeners must both program, got %d servers", len(servers))
 	}
 }
@@ -266,9 +266,9 @@ func TestConflicts_CrossGatewayDisjointAddresses(t *testing.T) {
 			t.Fatalf("%s listener must not conflict on disjoint bind addresses", gwName)
 		}
 	}
-	// Two sockets: each annotated gateway emits a default block + named block.
-	if len(g.Configuration().Servers) != 4 {
-		t.Fatalf("expected 4 servers, got %d", len(g.Configuration().Servers))
+	// Two sockets: each annotated gateway emits its named block.
+	if len(g.Configuration().Servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(g.Configuration().Servers))
 	}
 }
 

@@ -126,6 +126,15 @@ if pgrep -f '/tmp/opencode/host-nginx-gateway(-e2e)? ' >/dev/null 2>&1; then
 fi
 ok "no host-mode controller running (double-writer guard)"
 
+# Default-server fixture (environment property, v9 policy — DESIGN.md §3.3):
+# the controller never injects default servers; this test machine declares
+# its own via the shared script-managed fixture (80/443 wildcard + the
+# controller's loopback auto-assignment pool). The DS scenarios (8080/8082)
+# don't exercise unmatched hosts, but the environment must be identical no
+# matter which runner set it up. Idempotent; reload only on change.
+bash "$REPO_ROOT/e2e/install-default-server-fixture.sh" \
+  || die "default-server fixture installation failed"
+
 # baseline: include present, backend up, no leftover gateways/routes
 grep -qF "$INCLUDE_LINE" /etc/nginx/nginx.conf \
   || die "host nginx.conf lacks the k8s-gw include (run e2e/run.sh scenario 1b first)"

@@ -22,10 +22,15 @@ func TestConfiguration_ProtocolListenMapping(t *testing.T) {
 		),
 	)
 	cfg := g.Configuration()
-	// Per protocol-socket: the named block plus the synthetic default block
-	// (TLS sockets carry the listener cert so handshakes keep working).
-	if len(cfg.Servers) != 6 {
+	// Per protocol-socket: only the named (route/listener-claimed) block —
+	// the controller emits no synthetic default block.
+	if len(cfg.Servers) != 3 {
 		t.Fatalf("servers: %+v", cfg.Servers)
+	}
+	for _, s := range cfg.Servers {
+		if s.Hostname == "" {
+			t.Fatalf("no synthetic default block may be emitted, got: %+v", cfg.Servers)
+		}
 	}
 	byHostname := map[string]*contract.Server{}
 	for _, s := range cfg.Servers {

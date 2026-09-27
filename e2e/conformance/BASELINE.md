@@ -53,6 +53,7 @@ first (round B/C).
 | 5 | 36 | 0 | 1 | **GATEWAY-HTTP core green minus one.** B-grade feature push (weights, filters, method/header/query matching), GEP-722 precedence fall-through, controller-written status.addresses, per-Gateway loopback address assignment, reload-effect verification — ALL THREE harness shims removed. The single skip was `HTTPRouteCrossNamespace` (§3.5 deviation). |
 | 6 | 37 | 0 | 0 | **GATEWAY-HTTP core FULLY GREEN, nothing skipped.** Cross-namespace HTTPRoute attachment implemented per Gateway API v1: the TARGET Gateway's per-listener `allowedRoutes.namespaces` governs (Same/All/Selector/None), `allowedRoutes` IS the authorization (no ReferenceGrant for parentRefs), backendRefs keep defaulting to the route's namespace. |
 | **7 (this commit)** | **37** | **0** | **0** | **37/37 with a ZEROED exemption list.** RequestMirror (single + multiple + percentage via `split_clients $request_id` + internal mirror locations) and backendRef-level RequestHeaderModifier implemented per Gateway API v1 / the NGF mechanism (DESIGN.md §5.1.1). The four exemptions were no-ops for core test selection (all four are EXTENDED features), but they documented non-support; with the features implemented they are removed. Zeroing them flips the suite to GWC-status inference (unsupported), so the harness now declares the core feature set via `-supported-features` instead — identical selection. |
+| 9 (default-server policy) | 37 | 0 | 0 | **The controller no longer emits a synthetic default-server block** (DESIGN.md §3.3 v9: default servers belong to the host administrator's nginx.conf). Every emitted block is backed by a route claim; unmatched hosts follow nginx's own default-server rules. The test environment takes the administrator role via the script-managed fixture (see "Harness adaptations"). 37/37 unchanged. |
 
 Suite-reported core counts (round 7, `e2e/conformance/report.yaml`):
 **37 passed, 0 failed, 0 skipped** (GATEWAY-HTTP core, `result: success`).
@@ -209,7 +210,10 @@ Product features implemented (spec-first, Gateway API v1):
    route hostname share no host (apex listener vs wildcard route), the
    attachment serves nothing (`refineHostname`). An attachment-less claim set
    still renders an empty block. A synthetic empty default block answers 404
-   for hosts no route claims.
+   for hosts no route claims. (SUPERSEDED in round 9: the synthetic default
+   block was removed — default servers belong to the host administrator's
+   nginx.conf; the e2e environment provides its own via
+   `e2e/install-default-server-fixture.sh`.)
 2. **Listener distinctness fixed to spec** (`internal/provider/graph.go`):
    same-Gateway indistinctness is now EQUAL hostnames (or both empty) only —
    an exact listener and its covering wildcard are distinguishable
@@ -480,12 +484,28 @@ DESIGN.md was updated for all of the above (§3.2, §3.3 table, §3.5, §7, §8)
 
 ## Harness adaptations
 
-**None.** Rounds 2–4 carried three documented shims (BIND annotations, an
-address injector, HTTPS base Gateway deletion); round 5 replaced each with
-a product feature (per-Gateway loopback assignment, controller-written
-status.addresses, and the listener-distinctness + reload-verification
-fixes). See "Round-5 changes" above. `waitBaseGatewaysProgrammed` remains
-in `conformance_test.go` purely as a readiness gate.
+The suite flow carries NO shims: rounds 2–4 carried three documented
+workarounds (BIND annotations, an address injector, HTTPS base Gateway
+deletion); round 5 replaced each with a product feature (per-Gateway
+loopback assignment, controller-written status.addresses, and the
+listener-distinctness + reload-verification fixes). See "Round-5 changes"
+above. `waitBaseGatewaysProgrammed` remains in `conformance_test.go`
+purely as a readiness gate.
+
+Round 9 added ONE environment step, outside the suite flow: the
+**script-managed default-server fixture**
+(`e2e/install-default-server-fixture.sh`, installed by the runner scripts
+before the controller deploys and refreshed by `refreshDefaultServerFixture`
+in `conformance_test.go` once the base Gateways are programmed). The
+controller never injects default servers (DESIGN.md §3.3); the fixture IS
+the host administrator's default server for this test machine — placed in
+`/etc/nginx/conf.d/` (never in the controller-owned `k8s-gw/` directory)
+and included from the master nginx.conf. It answers 404 for unmatched
+Host/SNI on ports 80/443, both on the wildcard bind and across the
+controller's whole loopback auto-assignment pool (127.0.0.8–127.0.0.239).
+On 443 it presents the suite's own materialized certificate so the
+`HTTPRouteHTTPSListener` unmatched-SNI case (`unknown-example.org` → 404)
+passes client verification.
 
 ## Exempt features (documented deviations → DESIGN.md)
 

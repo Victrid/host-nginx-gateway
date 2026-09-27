@@ -44,7 +44,17 @@ type entry struct {
 // this builder — nginx multiplexes a socket's blocks by server_name.
 type socketBuild struct {
 	listens []contract.Listen
-	tlsCert string
+	// tlsByGroup maps effective hostname → the cert basename claimed for
+	// the group's server block (the block's ssl_certificate). Certificates
+	// are per GROUP, not per socket: two HTTPS listeners sharing a socket
+	// with disjoint hostname claims each keep their own certificate; the
+	// catch-all group ("") carries its claiming listener's certificate
+	// (hostname-less listeners are real routes). Groups without a claim
+	// render without TLS.
+	tlsByGroup map[string]string
+	// tlsClaimant maps the same keys to the listener that claimed them —
+	// the certificate-mismatch backstop names the other side.
+	tlsClaimant map[string]*ListenerInfo
 	// groups maps effective hostname → entries.
 	groups map[string][]*entry
 	// seen dedupes (rule, match, path) per hostname: the same rule match
@@ -91,6 +101,51 @@ func (s *socketBuild) add(hostname, path string, e *entry) {
 	s.groups[hostname] = append(s.groups[hostname], e)
 }
 
+// claimCert registers li's certificate for one of the listener's effective
+// hostname groups on this socket (the group's server block renders
+// ssl_certificate from it).
+//
+// Certificate-mismatch backstop (§3.2 no-silent-winner): when a second
+// listener on the same socket claims the SAME effective hostname with a
+// DIFFERENT non-empty certificate — reachable only through
+// distinguishable-but-overlapping listener claims that refine to one
+// hostname (an exact listener and a covering wildcard listener whose routes
+// meet at the same host) — one server block cannot serve both certificates.
+// Both listeners are marked Conflicted (HostnameConflict, mismatch named in
+// the message); no silent first-wins, matching §3.2's both-sides rule.
+func (s *socketBuild) claimCert(hostname string, li *ListenerInfo) {
+	if prev, ok := s.tlsByGroup[hostname]; ok {
+		if other := s.tlsClaimant[hostname]; prev != li.TLSCert &&
+			prev != "" && li.TLSCert != "" && other != nil && !other.Conflicted && !li.Conflicted {
+			markCertConflict(other, li, hostname)
+		}
+		return
+	}
+	if s.tlsByGroup == nil {
+		s.tlsByGroup = map[string]string{}
+		s.tlsClaimant = map[string]*ListenerInfo{}
+	}
+	s.tlsByGroup[hostname] = li.TLSCert
+	s.tlsClaimant[hostname] = li
+}
+
+// markCertConflict marks both sides of a same-hostname
+// different-certificate collision on one socket: Conflicted=True
+// (HostnameConflict) with the cert mismatch in the message — §3.2's
+// both-sides-no-winner shape (B2: no deterministic tie-break).
+func markCertConflict(a, b *ListenerInfo, hostname string) {
+	a.Conflicted, a.ConflictReason = true, string(gatewayv1.ListenerReasonHostnameConflict)
+	b.Conflicted, b.ConflictReason = true, string(gatewayv1.ListenerReasonHostnameConflict)
+	a.ConflictMsg = fmt.Sprintf(
+		"certificate conflict on port %d: hostname %q is claimed with certificate %q here and %q by listener %q of Gateway %s/%s; both listeners are conflicted, no server block is generated",
+		a.Spec.Port, hostname, a.TLSCert, b.TLSCert,
+		b.Spec.Name, b.Gateway.Resource.Namespace, b.Gateway.Resource.Name)
+	b.ConflictMsg = fmt.Sprintf(
+		"certificate conflict on port %d: hostname %q is claimed with certificate %q here and %q by listener %q of Gateway %s/%s; both listeners are conflicted, no server block is generated",
+		b.Spec.Port, hostname, b.TLSCert, a.TLSCert,
+		a.Spec.Name, a.Gateway.Resource.Namespace, a.Gateway.Resource.Name)
+}
+
 // Configuration translates the graph into the locked IR (DESIGN.md §5.4):
 // per-socket server blocks with GEP-722 hostname-precedence dispatch,
 // deterministic ordering.
@@ -107,10 +162,19 @@ func (s *socketBuild) add(hostname, path string, e *entry) {
 //     less-specific wildcard > catch-all) so that a request matching an
 //     exact-hostname route WITHOUT a matching path falls through to a
 //     broader route's matching path;
-//  3. emits the socket's default server: the merged catch-all block when a
-//     catch-all group exists (spec: it matches every host), otherwise a
-//     synthetic empty block so unmatched hosts answer 404 instead of
-//     leaking into any route.
+//  3. emits the socket's blocks: a real catch-all group (a hostname-less
+//     route claim, spec: it matches every host) is the socket's default
+//     server and is emitted first. Without one, NO default block is
+//     synthesized — unmatched hosts follow nginx's own default-server
+//     rules, owned by the host administrator; the controller never
+//     injects a default server.
+//  4. assigns each block its ssl_certificate from the listener that
+//     claimed the block's effective hostname (per-GROUP certificates, not
+//     a socket-wide latch): two HTTPS listeners sharing a socket with
+//     disjoint hostname claims keep their own certificates. A hostname
+//     claimed by two listeners with different certificates marks BOTH
+//     listeners Conflicted (§3.2 backstop, claimCert) before any block is
+//     committed, so neither side leaks into the rendered config.
 //
 // Location.Upstream values with the StaticUpstreamPrefix are markers: the
 // renderer emits `return <code>;` for them and Configuration.Upstreams
@@ -135,6 +199,25 @@ func (g *Graph) Configuration() *contract.Configuration {
 	// are attached only after the server loop confirms which gates survived
 	// location merging (attachSplitClients below).
 	mirrorIR, mirrorSplits := g.mirrorLocations(dispatcher, upstreams)
+
+	// Phase 1 — socket join and per-group certificate claims. Every
+	// listener joins the socket its (post-annotation) listen set normalizes
+	// to and claims its effective hostname groups with its own certificate:
+	// each group's server block renders ssl_certificate from its claiming
+	// listener, so two HTTPS listeners sharing a socket with disjoint
+	// hostname claims keep their own certificates (a socket-wide latch
+	// would hand the FIRST listener's certificate to every block). A group
+	// claimed twice with DIFFERENT non-empty certificates marks both
+	// listeners Conflicted HERE — before any block is committed — so phase
+	// 2 drops both sides in the same sync (§3.2 no-silent-winner).
+	type listenerPlan struct {
+		li *ListenerInfo
+		sb *socketBuild
+		// claims are the effective hostnames this listener contributes to
+		// its socket, in deterministic (attachment × route-hostname) order.
+		claims []string
+	}
+	var plans []listenerPlan
 
 	for _, gw := range g.Gateways {
 		if _, _, rejected := gw.rejection(); rejected {
@@ -173,44 +256,20 @@ func (g *Graph) Configuration() *contract.Configuration {
 			key := socketKeyOf(listens)
 			sb := sockets[key]
 			if sb == nil {
-				sb = &socketBuild{listens: listens, tlsCert: li.TLSCert}
+				sb = &socketBuild{listens: listens}
 				sockets[key] = sb
-			} else if sb.tlsCert == "" {
-				sb.tlsCert = li.TLSCert
 			}
 
-			// A listener with no attachments still renders its (empty)
-			// server block under the listener hostname — behaviour and
-			// status (Programmed) are unchanged by the grouping. With
-			// attachments, groups are created lazily from each
-			// attachment's effective hostnames so no spurious empty block
-			// appears next to them.
-			lg := map[string][]*entry{}
-			seenInListener := map[string]map[*RuleInfo]map[int]map[string]struct{}{}
-			addLocal := func(h, path string, e *entry) {
-				if seenInListener[h] == nil {
-					seenInListener[h] = map[*RuleInfo]map[int]map[string]struct{}{}
-				}
-				if seenInListener[h][e.rule] == nil {
-					seenInListener[h][e.rule] = map[int]map[string]struct{}{}
-				}
-				if seenInListener[h][e.rule][e.match] == nil {
-					seenInListener[h][e.rule][e.match] = map[string]struct{}{}
-				}
-				if _, dup := seenInListener[h][e.rule][e.match][path]; dup {
-					return
-				}
-				seenInListener[h][e.rule][e.match][path] = struct{}{}
-				lg[h] = append(lg[h], e)
-			}
+			p := listenerPlan{li: li, sb: sb}
 			if len(li.Attachments) == 0 {
-				h := hostnameString(li.Spec.Hostname)
-				lg[h] = nil
-				if h == "" {
-					sb.hasCatchAll = true
-				}
+				// The listener hostname is the only group an
+				// attachment-less listener contributes. A hostname-less
+				// listener is a real route: its catch-all claim ("")
+				// carries the listener's certificate to the socket's
+				// default block.
+				p.claims = []string{hostnameString(li.Spec.Hostname)}
 			} else {
-				hasCA := false
+				seen := map[string]struct{}{}
 				for _, att := range li.Attachments {
 					for _, eff := range hostnameIntersection(att.Route.Resource.Spec.Hostnames, li.Spec.Hostname) {
 						bh, ok := refineHostname(li.Spec.Hostname, eff)
@@ -221,41 +280,105 @@ func (g *Graph) Configuration() *contract.Configuration {
 							// for status but serves no requests.
 							continue
 						}
-						if bh == "" {
-							hasCA = true
+						if _, dup := seen[bh]; dup {
+							continue
 						}
-						for _, rule := range att.Route.Rules {
-							if !rule.Valid {
-								continue
-							}
-							up, _ := g.ruleUpstream(gw, att.Route, rule, upstreams)
-							for mi, paths := range rule.MatchPaths {
-								cases := rule.MatchCases[mi]
-								for _, path := range paths {
-									seq++
-									addLocal(bh, path, &entry{
-										seq: seq, rule: rule, match: mi, path: path,
-										upstream: up, constraints: cases,
-									})
-								}
+						seen[bh] = struct{}{}
+						p.claims = append(p.claims, bh)
+					}
+				}
+			}
+			for _, h := range p.claims {
+				sb.claimCert(h, li)
+			}
+			plans = append(plans, p)
+		}
+	}
+
+	// Phase 2 — per-listener entry collection (unchanged semantics),
+	// skipping listeners the phase-1 certificate backstop conflicted.
+	for _, p := range plans {
+		li, sb := p.li, p.sb
+		if li.Conflicted {
+			continue // backstop conflict: both sides were marked in phase 1
+		}
+
+		// A listener with no attachments still renders its (empty)
+		// server block under the listener hostname — behaviour and
+		// status (Programmed) are unchanged by the grouping. With
+		// attachments, groups are created lazily from each
+		// attachment's effective hostnames so no spurious empty block
+		// appears next to them.
+		lg := map[string][]*entry{}
+		seenInListener := map[string]map[*RuleInfo]map[int]map[string]struct{}{}
+		addLocal := func(h, path string, e *entry) {
+			if seenInListener[h] == nil {
+				seenInListener[h] = map[*RuleInfo]map[int]map[string]struct{}{}
+			}
+			if seenInListener[h][e.rule] == nil {
+				seenInListener[h][e.rule] = map[int]map[string]struct{}{}
+			}
+			if seenInListener[h][e.rule][e.match] == nil {
+				seenInListener[h][e.rule][e.match] = map[string]struct{}{}
+			}
+			if _, dup := seenInListener[h][e.rule][e.match][path]; dup {
+				return
+			}
+			seenInListener[h][e.rule][e.match][path] = struct{}{}
+			lg[h] = append(lg[h], e)
+		}
+		if len(li.Attachments) == 0 {
+			h := hostnameString(li.Spec.Hostname)
+			lg[h] = nil
+			if h == "" {
+				sb.hasCatchAll = true
+			}
+		} else {
+			hasCA := false
+			for _, att := range li.Attachments {
+				for _, eff := range hostnameIntersection(att.Route.Resource.Spec.Hostnames, li.Spec.Hostname) {
+					bh, ok := refineHostname(li.Spec.Hostname, eff)
+					if !ok {
+						// The listener's claim and the route hostname
+						// share NO common host (e.g. an apex listener
+						// with a wildcard route): the attachment counts
+						// for status but serves no requests.
+						continue
+					}
+					if bh == "" {
+						hasCA = true
+					}
+					for _, rule := range att.Route.Rules {
+						if !rule.Valid {
+							continue
+						}
+						up, _ := g.ruleUpstream(li.Gateway, att.Route, rule, upstreams)
+						for mi, paths := range rule.MatchPaths {
+							cases := rule.MatchCases[mi]
+							for _, path := range paths {
+								seq++
+								addLocal(bh, path, &entry{
+									seq: seq, rule: rule, match: mi, path: path,
+									upstream: up, constraints: cases,
+								})
 							}
 						}
 					}
 				}
-				if hasCA {
-					sb.hasCatchAll = true
-				}
 			}
+			if hasCA {
+				sb.hasCatchAll = true
+			}
+		}
 
-			// Listener-scoped GEP-722 precedence merge: broader-hostname
-			// groups of THIS listener fold into narrower ones; the
-			// listener's catch-all never absorbs other claims and never
-			// leaks across listeners (requests match at most one listener).
-			for h, entries := range mergeListenerGroups(lg) {
-				sb.ensure(h)
-				for _, e := range entries {
-					sb.add(h, e.path, e)
-				}
+		// Listener-scoped GEP-722 precedence merge: broader-hostname
+		// groups of THIS listener fold into narrower ones; the
+		// listener's catch-all never absorbs other claims and never
+		// leaks across listeners (requests match at most one listener).
+		for h, entries := range mergeListenerGroups(lg) {
+			sb.ensure(h)
+			for _, e := range entries {
+				sb.add(h, e.path, e)
 			}
 		}
 	}
@@ -273,7 +396,7 @@ func (g *Graph) Configuration() *contract.Configuration {
 			entries := sb.groups[hostname]
 			srv := &contract.Server{
 				Hostname: hostname,
-				TLSCert:  sb.tlsCert,
+				TLSCert:  sb.tlsByGroup[hostname],
 				Listens:  sb.listens,
 			}
 			srv.Locations = buildLocations(entries, dispatcher)
@@ -615,12 +738,16 @@ func wildcardCovers(w, n string) bool {
 }
 
 // socketBlockOrder returns the server-block hostnames for a socket in
-// emission order: the default server first, then named hostnames lexically.
-// The default server is the merged catch-all block when the socket has one
-// (spec: a hostname-less route matches every host of its listener);
-// otherwise a synthetic empty block is emitted so unmatched hosts answer
-// 404 instead of leaking into any route (nginx default server = first
-// block listed for the socket).
+// emission order: the catch-all group first when one exists (it is the
+// socket's default server — spec: a hostname-less route matches every
+// host of its listener, and nginx's default server is the first block
+// listed for the socket), then the named hostnames lexically.
+//
+// Without a catch-all group the controller emits NO default block: the
+// default server for the socket is whatever the host administrator's
+// nginx.conf declares (a `default_server` listen flag, or nginx's
+// first-block rule across all blocks on the socket). The controller never
+// injects a synthetic default server (DESIGN.md §3.3).
 func socketBlockOrder(sb *socketBuild) []string {
 	names := make([]string, 0, len(sb.groups))
 	for name := range sb.groups {
@@ -634,14 +761,8 @@ func socketBlockOrder(sb *socketBuild) []string {
 	final := make([]string, 0, len(names)+1)
 	if sb.hasCatchAll {
 		final = append(final, "")
-	} else if len(names) > 0 {
-		// No route claims unmatched hosts: an empty default block answers
-		// 404 (spec: unknown hosts must not leak into a route).
-		sb.ensure("")
-		final = append(final, "")
 	}
-	final = append(final, names...)
-	return final
+	return append(final, names...)
 }
 
 // refineHostname computes the nginx server_name for an attachment: the

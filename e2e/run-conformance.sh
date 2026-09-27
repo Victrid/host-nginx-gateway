@@ -9,9 +9,15 @@
 # data plane, and always tears down afterwards.
 #
 # Environment adaptations made by the harness (e2e/conformance/
-# conformance_test.go, fully documented in BASELINE.md): none — the round-5
-# product features replaced all three former shims (bind annotations,
-# address injection, HTTPS base Gateway deletion).
+# conformance_test.go, fully documented in BASELINE.md): none inside the
+# suite flow — the round-5 product features replaced all three former
+# shims (bind annotations, address injection, HTTPS base Gateway
+# deletion). Round 9 added one pre/post-suite environment step: the
+# script-managed default-server fixture
+# (e2e/install-default-server-fixture.sh) is installed before the
+# controller deploys and refreshed onto the suite certificate after the
+# base Gateways are programmed — the controller itself never injects
+# default servers (DESIGN.md §3.3).
 #
 # Prerequisites: same cluster/env as e2e/run.sh (k3s node hng-e2e, host
 # nginx with the k8s-gw include), docker, helm (auto-installed like
@@ -128,6 +134,10 @@ teardown() {
   # either deployment form can run next (same courtesy as run-daemonset.sh)
   rm -f /etc/nginx/conf.d/k8s-gw/00-global.conf /etc/nginx/conf.d/k8s-gw/00-global.conf.prev \
     /etc/nginx/conf.d/k8s-gw/error.log
+  # The default-server fixture STAYS: it is part of this machine's
+  # pre-configured master nginx.conf (like an administrator's default
+  # server), not controller output. e2e/install-default-server-fixture.sh
+  # re-applies it idempotently on the next run.
 }
 
 # ---------------------------------------------------------------------------
@@ -171,6 +181,24 @@ if KN get ds host-nginx-gateway >/dev/null 2>&1; then
   wait_until "stale daemonset gone" 60 "! KN get ds host-nginx-gateway >/dev/null 2>&1"
 fi
 ok "no double writers"
+
+# ---------------------------------------------------------------------------
+# Default-server fixture (v9 policy: the controller never injects default
+# servers — DESIGN.md §3.3). The suite asserts that requests with a Host/
+# SNI no route claims answer 404; in production that is the host
+# administrator's nginx.conf doing its job, so this controlled test
+# environment pre-configures its own default servers. The shared installer
+# (e2e/install-default-server-fixture.sh) drops a script-managed fixture
+# into /etc/nginx/conf.d/ (never into the controller-owned k8s-gw/ dir),
+# includes it from the master nginx.conf and reloads. The 443 blocks start
+# on a self-signed fixture certificate; conformance_test.go refreshes them
+# onto the suite's materialized certificate once the base Gateways are
+# programmed (HTTPS requests to unmatched SNI must present a cert the
+# suite client trusts).
+log "default-server fixture (the script acts as the host administrator)"
+bash "$REPO_ROOT/e2e/install-default-server-fixture.sh" \
+  || die "default-server fixture installation failed"
+ok "default-server fixture installed (80/443 wildcard + loopback pool)"
 
 # ---------------------------------------------------------------------------
 log "suite backend images (docker pull + k3s ctr import)"
@@ -283,9 +311,9 @@ if [ -f "$REPORT_OUT" ]; then
 else
   bad "no report written — suite died before cleanup (log: $TEST_LOG)"
 fi
-PASSN=$(grep -cE '^--- PASS:' "$TEST_LOG" || true)
-FAILN=$(grep -cE '^--- FAIL:' "$TEST_LOG" || true)
-SKIPN=$(grep -cE '^--- SKIP:' "$TEST_LOG" || true)
+PASSN=$(grep -cE '^[[:space:]]*--- PASS:' "$TEST_LOG" || true)
+FAILN=$(grep -cE '^[[:space:]]*--- FAIL:' "$TEST_LOG" || true)
+SKIPN=$(grep -cE '^[[:space:]]*--- SKIP:' "$TEST_LOG" || true)
 printf 'subtests: %d passed, %d failed, %d skipped\n' "$PASSN" "$FAILN" "$SKIPN"
 
 if [ "$RC" = 0 ] && [ "${FAILN:-0}" = 0 ]; then

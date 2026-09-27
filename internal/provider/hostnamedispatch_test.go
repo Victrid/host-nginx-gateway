@@ -61,18 +61,15 @@ func TestHostnameDispatch_ExactIntersection(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a foo.com server, got %+v", cfg.Servers)
 	}
-	if len(cfg.Servers) != 2 {
-		t.Fatalf("one effective hostname → named block + synthetic default, got %d", len(cfg.Servers))
+	if len(cfg.Servers) != 1 {
+		t.Fatalf("one effective hostname → exactly one named block (no synthetic default), got %+v", cfg.Servers)
 	}
-	if dflt := servers[""]; dflt == nil || len(dflt.Locations) != 0 {
-		t.Fatalf("synthetic default block must exist and be empty: %+v", servers[""])
+	upstreams := upstreamsOf(srv)
+	if upstreams["/a/"] != "default_svca_8080" || upstreams["= /a"] != "default_svca_8080" {
+		t.Fatalf("route a locations missing: %+v", upstreams)
 	}
-	up := upstreamsOf(srv)
-	if up["/a/"] != "default_svca_8080" || up["= /a"] != "default_svca_8080" {
-		t.Fatalf("route a locations missing: %+v", up)
-	}
-	if up["/b/"] != "default_svcb_8080" {
-		t.Fatalf("route b locations missing: %+v", up)
+	if upstreams["/b/"] != "default_svcb_8080" {
+		t.Fatalf("route b locations missing: %+v", upstreams)
 	}
 }
 
@@ -85,15 +82,15 @@ func TestHostnameDispatch_RouteWithoutHostnamesInheritsListener(t *testing.T) {
 		testSlice("default", "svc", 8080, ptr(true), "10.0.0.1"),
 	)
 	cfg := g.Configuration()
-	if len(cfg.Servers) != 2 {
-		t.Fatalf("named block + synthetic default expected: %+v", cfg.Servers)
+	if len(cfg.Servers) != 1 {
+		t.Fatalf("exactly one named block expected (no synthetic default): %+v", cfg.Servers)
 	}
 	servers := serversByHostname(t, cfg)
 	if up := upstreamsOf(servers["foo.com"]); up["/"] != "default_svc_8080" {
 		t.Fatalf("hostname-less route must land in the listener-hostname server: %+v", cfg.Servers)
 	}
-	if dflt := servers[""]; dflt == nil || len(dflt.Locations) != 0 {
-		t.Fatalf("default block must be empty: %+v", servers[""])
+	if _, has := servers[""]; has {
+		t.Fatalf("no synthetic default block may be emitted: %+v", cfg.Servers)
 	}
 }
 
@@ -125,8 +122,8 @@ func TestHostnameDispatch_DistinctHostnames(t *testing.T) {
 		testSlice("default", "svcb", 8080, ptr(true), "10.0.0.2"),
 	)
 	cfg := g.Configuration()
-	if len(cfg.Servers) != 3 {
-		t.Fatalf("two effective hostnames → two named + synthetic default, got %+v", cfg.Servers)
+	if len(cfg.Servers) != 2 {
+		t.Fatalf("two effective hostnames → exactly two named blocks (no synthetic default), got %+v", cfg.Servers)
 	}
 	servers := serversByHostname(t, cfg)
 	// The SAME path under DIFFERENT hostnames must NOT be dropped: dispatch
@@ -162,8 +159,8 @@ func TestHostnameDispatch_WildcardListenerAndHostnamelessRoute(t *testing.T) {
 		testSlice("default", "svcc", 8080, ptr(true), "10.0.0.3"),
 	)
 	cfg := g.Configuration()
-	if len(cfg.Servers) != 4 {
-		t.Fatalf("three effective hostnames → three named + synthetic default, got %+v", cfg.Servers)
+	if len(cfg.Servers) != 3 {
+		t.Fatalf("three effective hostnames → exactly three named blocks (no synthetic default), got %+v", cfg.Servers)
 	}
 	servers := serversByHostname(t, cfg)
 	// GEP-722 fall-through: the exact subdomain blocks carry their own /x
@@ -339,11 +336,11 @@ func TestHostnameDispatch_DeterministicAndRenderable(t *testing.T) {
 	if a.String() != b.String() {
 		t.Fatalf("configuration must be deterministic:\n%s\nvs\n%s", a, b)
 	}
-	// Named hostname groups sort lexically and deterministically; the
-	// synthetic default block (unmatched hosts → 404, no route leak) is
-	// listed first.
-	if len(a.Servers) != 3 || a.Servers[0].Hostname != "" || a.Servers[1].Hostname != "a.com" || a.Servers[2].Hostname != "b.com" {
-		t.Fatalf("expected deterministic default/a.com/b.com blocks: %+v", a.Servers)
+	// Named hostname groups sort lexically and deterministically; no
+	// synthetic default block exists (the host nginx.conf owns default
+	// servers).
+	if len(a.Servers) != 2 || a.Servers[0].Hostname != "a.com" || a.Servers[1].Hostname != "b.com" {
+		t.Fatalf("expected deterministic a.com/b.com blocks: %+v", a.Servers)
 	}
 	rendered, err := dataplane.Render(a)
 	if err != nil {
@@ -359,5 +356,39 @@ func TestHostnameDispatch_DeterministicAndRenderable(t *testing.T) {
 	// carries proxy_set_header Host $http_host.
 	if !strings.Contains(string(rendered), "proxy_set_header Host $http_host;") {
 		t.Fatalf("rendered config must preserve the client Host header:\n%s", rendered)
+	}
+}
+
+func TestConfiguration_NoBlocksBeyondRouteBackedGroups(t *testing.T) {
+	// The controller never injects a synthetic default-server block: every
+	// emitted server block must be backed by a route claim (an effective
+	// hostname of some attachment, or the listener hostname a
+	// hostname-less route inherits). Unmatched hosts are the host
+	// administrator's business (their nginx.conf declares default
+	// servers).
+	g := build(t,
+		testClass("c", ControllerName, 1),
+		testGateway("default", "gw", "c", 1,
+			plainListener("web", 80, host("foo.com")),
+			plainListener("secure", 443, host("*.bar.com")),
+		),
+		testRoute("default", "a", 1, []gatewayv1.Hostname{"foo.com"},
+			[]gatewayv1.ParentReference{gwParent("gw")},
+			pathBackendRule(gatewayv1.PathMatchPathPrefix, "/a", "svca", 8080)),
+		testRoute("default", "b", 1, []gatewayv1.Hostname{"*.bar.com"},
+			[]gatewayv1.ParentReference{gwParent("gw")},
+			pathBackendRule(gatewayv1.PathMatchPathPrefix, "/b", "svcb", 8080)),
+		testSlice("default", "svca", 8080, ptr(true), "10.0.0.1"),
+		testSlice("default", "svcb", 8080, ptr(true), "10.0.0.2"),
+	)
+	cfg := g.Configuration()
+	want := map[string]bool{"foo.com": true, "*.bar.com": true}
+	if len(cfg.Servers) != len(want) {
+		t.Fatalf("route-backed blocks only: want hostnames %v, got %+v", want, cfg.Servers)
+	}
+	for _, s := range cfg.Servers {
+		if !want[s.Hostname] {
+			t.Fatalf("block %q is not backed by any route claim (synthetic default?): %+v", s.Hostname, s)
+		}
 	}
 }
