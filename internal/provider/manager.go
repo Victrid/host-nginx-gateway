@@ -64,6 +64,17 @@ type Options struct {
 	// detected node primary IP). See PublishAddresses.
 	FallbackAddresses []string
 
+	// AllowNginxSnippets enables the hng.victrid.dev/server-snippet and
+	// hng.victrid.dev/location-snippet annotations
+	// (--dangerously-allow-nginx-snippets, DESIGN-multinode-addresses.md
+	// §5). Default false: the annotations are ignored with a warning.
+	AllowNginxSnippets bool
+
+	// AllowExtraFiles enables the hng.victrid.dev/extra-files annotation
+	// (--dangerously-allow-extra-files, DESIGN-multinode-addresses.md §5).
+	// Default false: the annotation is ignored with a warning.
+	AllowExtraFiles bool
+
 	// MinSyncInterval is the minimum spacing between full syncs; defaults
 	// to 1s (DESIGN.md §7).
 	MinSyncInterval time.Duration
@@ -123,6 +134,8 @@ func Run(ctx context.Context, opts Options) error {
 	rec := NewReconciler(mgr.GetClient(), opts.Applier, opts.MinSyncInterval, opts.Log)
 	rec.PublishAddresses = opts.PublishAddresses
 	rec.FallbackAddresses = opts.FallbackAddresses
+	rec.AllowNginxSnippets = opts.AllowNginxSnippets
+	rec.AllowExtraFiles = opts.AllowExtraFiles
 
 	// Full-reconcile controller: every event on any watched type enqueues a
 	// full sync; the request itself is ignored. MaxConcurrentReconciles=1
@@ -137,6 +150,7 @@ func Run(ctx context.Context, opts Options) error {
 		Watches(&corev1.Service{}, &handler.EnqueueRequestForObject{}).
 		Watches(&corev1.Namespace{}, &handler.EnqueueRequestForObject{}).
 		Watches(&gatewayv1.ReferenceGrant{}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.ConfigMap{}, &handler.EnqueueRequestForObject{}).
 		WithOptions(controller.TypedOptions[reconcile.Request]{
 			MaxConcurrentReconciles: 1,
 			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](
@@ -167,6 +181,11 @@ type Reconciler struct {
 	// (§3.4; see Options).
 	PublishAddresses  []string
 	FallbackAddresses []string
+
+	// AllowNginxSnippets / AllowExtraFiles gate the escape-hatch
+	// annotations (see Options; DESIGN-multinode-addresses.md §5).
+	AllowNginxSnippets bool
+	AllowExtraFiles    bool
 
 	gate *syncGate
 }
@@ -205,7 +224,16 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("provider: list resources: %w", err)
 	}
-	graph := BuildGraph(res)
+	graph := BuildGraph(res, GraphOptions{
+		AllowNginxSnippets: r.AllowNginxSnippets,
+		AllowExtraFiles:    r.AllowExtraFiles,
+	})
+	// BuildGraph is pure: advisories (legacy annotation deprecations,
+	// flag-gated annotations ignored, skipped extra-file refs) surface as
+	// controller log lines here — deliberately NOT as status conditions.
+	for _, w := range graph.Warnings {
+		r.Log.Info(w)
+	}
 	cfg := graph.Configuration()
 	certs := graph.Certificates()
 
@@ -331,6 +359,16 @@ func ListResources(ctx context.Context, c client.Client) (*Resources, error) {
 	}
 	for i := range grants.Items {
 		res.ReferenceGrants = append(res.ReferenceGrants, &grants.Items[i])
+	}
+
+	// ConfigMaps feed the extra-files escape hatch (§5a): data keys are
+	// materialised under <conf-dir>/files/.
+	var configmaps corev1.ConfigMapList
+	if err := c.List(ctx, &configmaps); err != nil {
+		return nil, fmt.Errorf("configmaps: %w", err)
+	}
+	for i := range configmaps.Items {
+		res.ConfigMaps = append(res.ConfigMaps, &configmaps.Items[i])
 	}
 	return res, nil
 }

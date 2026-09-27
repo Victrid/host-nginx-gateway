@@ -94,6 +94,32 @@ server {
 | Cross-namespace `parentRefs` | ✅ | Governed by `allowedRoutes` (no ReferenceGrant needed, per spec) |
 | Cross-namespace `backendRefs` / TLS Secrets | ✅ | Requires ReferenceGrant |
 
+### Annotations
+
+The controller's own annotations live in the `hng.victrid.dev/` namespace. Until v0.3.0 the legacy `gateway.host-nginx/<name>` spellings are still read when the new-style key is absent (a deprecation warning is logged each sync); the new-style value always wins on conflict.
+
+| Annotation | Object | Purpose |
+|---|---|---|
+| `hng.victrid.dev/listen-addresses` | Gateway | Comma-separated bind addresses that replace the wildcard `listen` (e.g. `"192.168.1.10,[::]"`) |
+| `hng.victrid.dev/publish-addresses` | Gateway | Comma-separated IPs reported in `status.addresses` (overrides `--publish-addresses`) |
+
+### Escape hatch: raw nginx snippets and extra files (danger flags)
+
+> [!WARNING]
+> **Threat model**: annotation writers are trusted at cluster-admin level. Snippets are injected into your host nginx **verbatim** — no sanitization. The safety net is the existing `nginx -t` validation + automatic rollback.
+
+Two opt-in flags unlock escape-hatch annotations (both default to **off**; ignored annotations produce a controller warning log, never a status condition):
+
+* `--dangerously-allow-nginx-snippets` (Helm: `dangerouslyAllowNginxSnippets: true`)
+  * `hng.victrid.dev/server-snippet` on a **Gateway**: raw nginx config injected inside every server block rendered from that Gateway (after the `server_name`/`ssl_*` directives, before the `location` blocks).
+  * `hng.victrid.dev/location-snippet` on an **HTTPRoute**: raw nginx config appended inside every location block generated from that route's rules.
+* `--dangerously-allow-extra-files` (Helm: `dangerouslyAllowExtraFiles: true`)
+  * `hng.victrid.dev/extra-files` on a **Gateway**: comma-separated same-namespace refs (`configmap:ns/name`, `secret:ns/name`; `configmap:name` defaults to the Gateway's namespace). Every data key is materialised under `<nginx-conf-dir>/files/<ns>_<name>/<key>` (atomic write + orphan cleanup). Cross-namespace refs and missing objects are skipped with a warning.
+
+Inside snippet text, `@<key>@` is replaced with the absolute materialised path of that extra-file entry (e.g. `content_by_lua_file @app.lua@;`). A placeholder matching no extra file fails the whole sync — `Programmed=False`, nothing written. **Snippets containing other literal `@` characters are your problem**: any `@…@` pair is treated as a placeholder.
+
+These annotations exist only in the new namespace — there is no `gateway.host-nginx/` fallback for them.
+
 ### How it works
 
 ```

@@ -53,6 +53,15 @@ healthzAddr: 127.0.0.1:9125
 probes:
   enabled: true
 
+# -- Escape-hatch danger flags (DESIGN-multinode-addresses.md §5). Both
+# default to OFF: the hng.victrid.dev/server-snippet /
+# location-snippet / extra-files annotations are then ignored (with a
+# controller warning). Enabling them trusts annotation writers at
+# cluster-admin level — snippets are injected into the host nginx
+# verbatim; the nginx -t + rollback pipeline is the safety net.
+dangerouslyAllowNginxSnippets: false
+dangerouslyAllowExtraFiles: false
+
 # -- Extra container args appended after the templated ones.
 args: []
 

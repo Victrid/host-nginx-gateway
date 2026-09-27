@@ -35,11 +35,21 @@ const (
 	// with any other controllerName are ignored.
 	ControllerName gatewayv1.GatewayController = "gateway.host-nginx/controller"
 
+	// AnnotationPrefix is the namespace of the controller's own
+	// annotations since v0.2.0 (DESIGN-multinode-addresses.md §5:
+	// "全部自有注解统一为 hng.victrid.dev/<name>").
+	AnnotationPrefix = "hng.victrid.dev/"
+
+	// LegacyAnnotationPrefix is the pre-v0.2.0 annotation namespace. Read
+	// as a ONE-VERSION fallback (v0.2.0 only) when the new-style key is
+	// absent; usage logs a deprecation warning. Removed in v0.3.0.
+	LegacyAnnotationPrefix = "gateway.host-nginx/"
+
 	// ListenAddressesAnnotation carries a comma-separated list of extra bind
 	// addresses for every listener port of a Gateway (DESIGN.md §3.1):
 	//
-	//	gateway.host-nginx/listen-addresses: "192.168.1.10,[::]"
-	ListenAddressesAnnotation = "gateway.host-nginx/listen-addresses"
+	//	hng.victrid.dev/listen-addresses: "192.168.1.10,[::]"
+	ListenAddressesAnnotation = AnnotationPrefix + "listen-addresses"
 
 	// PublishAddressesAnnotation overrides the addresses this controller
 	// reports in Gateway status.addresses (DESIGN.md §3.4). Comma-separated
@@ -47,8 +57,33 @@ const (
 	// then to an auto-assigned loopback (cross-Gateway same-port separation),
 	// then to the detected node IP.
 	//
-	//	gateway.host-nginx/publish-addresses: "192.168.1.10"
-	PublishAddressesAnnotation = "gateway.host-nginx/publish-addresses"
+	//	hng.victrid.dev/publish-addresses: "192.168.1.10"
+	PublishAddressesAnnotation = AnnotationPrefix + "publish-addresses"
+
+	// ServerSnippetAnnotation injects raw nginx configuration inside every
+	// server block rendered from the Gateway
+	// (DESIGN-multinode-addresses.md §5 escape hatch). Honored only when
+	// --dangerously-allow-nginx-snippets is set; NO legacy fallback.
+	//
+	//	hng.victrid.dev/server-snippet: "sub_filter_types text/css;"
+	ServerSnippetAnnotation = AnnotationPrefix + "server-snippet"
+
+	// LocationSnippetAnnotation (HTTPRoute metadata) injects raw nginx
+	// configuration inside every location block generated from that
+	// route's rules. Honored only when --dangerously-allow-nginx-snippets
+	// is set; NO legacy fallback.
+	//
+	//	hng.victrid.dev/location-snippet: "proxy_buffering off;"
+	LocationSnippetAnnotation = AnnotationPrefix + "location-snippet"
+
+	// ExtraFilesAnnotation (Gateway metadata) is a comma-separated list of
+	// same-namespace refs whose data keys are materialised under
+	// <conf-dir>/files/<ns>_<name>/<key> (DESIGN-multinode-addresses.md
+	// §5): "configmap:ns/name" and "secret:ns/name". Honored only when
+	// --dangerously-allow-extra-files is set; NO legacy fallback.
+	//
+	//	hng.victrid.dev/extra-files: "configmap:default/lua,secret:default/chain"
+	ExtraFilesAnnotation = AnnotationPrefix + "extra-files"
 
 	// autoAssignBase / autoAssignSpan define the loopback pool used to give
 	// indistinct cross-Gateway listeners distinct bind addresses
@@ -68,6 +103,41 @@ const (
 	// TLSSecretType is the only Secret type accepted for certificates.
 	TLSSecretType corev1.SecretType = "kubernetes.io/tls"
 )
+
+// GraphOptions carries the operator's escape-hatch flags into BuildGraph
+// (DESIGN-multinode-addresses.md §5a danger flags). Both default to false:
+// snippet / extra-file annotations are then ignored with a recorded
+// warning (surfaced as a controller log line by the reconciler — no
+// status condition, the flags are the deliberate gate).
+type GraphOptions struct {
+	// AllowNginxSnippets enables the hng.victrid.dev/server-snippet and
+	// hng.victrid.dev/location-snippet annotations.
+	AllowNginxSnippets bool
+	// AllowExtraFiles enables the hng.victrid.dev/extra-files annotation.
+	AllowExtraFiles bool
+}
+
+// annotationValue reads one of the controller's own annotations, new
+// namespace first, with the one-version legacy fallback
+// (DESIGN-multinode-addresses.md §0: v0.2.0 keeps reading
+// gateway.host-nginx/<name> with a deprecation warning; v0.3.0 removes it).
+// newName is the full new-style key; the legacy key is derived by swapping
+// the prefix. An empty new-style value counts as absent (the fallback
+// fires). usedLegacy reports that the legacy spelling supplied the value,
+// so the caller records the deprecation warning.
+func annotationValue(annotations map[string]string, newName string) (value string, usedLegacy bool) {
+	if annotations == nil {
+		return "", false
+	}
+	if v, ok := annotations[newName]; ok && v != "" {
+		return v, false
+	}
+	legacy := LegacyAnnotationPrefix + strings.TrimPrefix(newName, AnnotationPrefix)
+	if v, ok := annotations[legacy]; ok && v != "" {
+		return v, true
+	}
+	return "", false
+}
 
 // StaticUpstreamName returns the marker upstream name for a static response
 // code (e.g. hng_static_500).
@@ -114,6 +184,9 @@ type Resources struct {
 	// and listener certificateRefs (Gateway → Secret) per the Gateway API
 	// ReferenceGrant spec (§3.5).
 	ReferenceGrants []*gatewayv1.ReferenceGrant
+	// ConfigMaps feed the --dangerously-allow-extra-files escape hatch
+	// (DESIGN-multinode-addresses.md §5: extra-files refs).
+	ConfigMaps []*corev1.ConfigMap
 }
 
 // Graph is the resolved IR: ownership, listener validity, conflicts, route
@@ -123,6 +196,19 @@ type Graph struct {
 	Classes  []*ClassInfo
 	Gateways []*GatewayInfo
 	Routes   []*RouteInfo
+
+	// Warnings are deterministic, human-readable advisories collected
+	// while building the graph (legacy-annotation deprecations, escape-
+	// hatch annotations ignored because their danger flag is off, skipped
+	// extra-file refs). BuildGraph stays pure — it records instead of
+	// logging; the reconciler turns these into controller log lines.
+	Warnings []string
+}
+
+// warn records one advisory on the graph (deterministic order: the order
+// BuildGraph noticed them).
+func (g *Graph) warn(msg string) {
+	g.Warnings = append(g.Warnings, msg)
 }
 
 // ClassInfo is an owned GatewayClass (spec.controllerName == ControllerName).
@@ -156,6 +242,35 @@ type GatewayInfo struct {
 	// plane must keep the combined listener set distinct — the address is
 	// part of that tuple). Empty when no assignment was needed.
 	AutoAddress string
+
+	// PublishAddresses is the resolved publish-addresses annotation value
+	// (new namespace, legacy fallback applied by BuildGraph). StatusAddresses
+	// reads this instead of the raw annotations.
+	PublishAddresses string
+
+	// RawServerSnippet is the Gateway's hng.victrid.dev/server-snippet
+	// value, populated only when --dangerously-allow-nginx-snippets is on
+	// (DESIGN-multinode-addresses.md §5); copied onto every listener in
+	// resolveListener and from the claiming listener onto the rendered
+	// server blocks.
+	RawServerSnippet string
+
+	// ExtraFiles are the materialised extra-file entries resolved from
+	// hng.victrid.dev/extra-files (only when
+	// --dangerously-allow-extra-files is on): one entry per (ref, data
+	// key), RelPath relative to the owned conf dir. Configuration()
+	// copies them into contract.Configuration.ExtraFiles.
+	ExtraFiles []ExtraFileEntry
+}
+
+// ExtraFileEntry is one resolved extra-files data key
+// (DESIGN-multinode-addresses.md §5). RelPath is always
+// "files/<ns>_<name>/<key>" — the path the applier materialises under the
+// owned conf dir and the base of the absolute path snippet placeholders
+// resolve to.
+type ExtraFileEntry struct {
+	RelPath string
+	Content []byte
 }
 
 // ListenerInfo is the resolution result for one spec.listeners[] entry.
@@ -197,6 +312,9 @@ type ListenerInfo struct {
 
 	// Addresses are the extra bind addresses from ListenAddressesAnnotation.
 	Addresses []string
+	// RawServerSnippet carries the Gateway's server-snippet annotation
+	// through to the rendered server blocks (see GatewayInfo.RawServerSnippet).
+	RawServerSnippet string
 	// TLSCert is the deterministic cert filename ("" when TLS is absent or
 	// unresolvable — the server is then emitted without ssl, §3.4).
 	TLSCert string
@@ -254,6 +372,11 @@ type RuleInfo struct {
 	// Valid rules are emitted. Invalid ("dropped") rules set PartiallyInvalid.
 	Valid      bool
 	InvalidMsg string
+	// RawSnippet is the route's hng.victrid.dev/location-snippet value
+	// (route-level: applies to every location generated from this rule),
+	// populated only when --dangerously-allow-nginx-snippets is on
+	// (DESIGN-multinode-addresses.md §5).
+	RawSnippet string
 	// Locations are nginx-ready location matchers ("= /x", "/x/", "/").
 	Locations []string
 	// Upstream is the rule's single-backend upstream: ns_svc_port or
@@ -364,8 +487,9 @@ type MatchConstraint struct {
 // per-listener allowedRoutes (Gateway API v1: allowedRoutes IS the
 // authorization — no ReferenceGrant applies to Gateway-route attachment);
 // ReferenceGrants gate only cross-namespace backendRefs and listener
-// certificateRefs (§3.5).
-func BuildGraph(res *Resources) *Graph {
+// certificateRefs (§3.5). opts carries the danger flags gating the snippet
+// / extra-file escape-hatch annotations (DESIGN-multinode-addresses.md §5).
+func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 	g := &Graph{}
 
 	// 1. Owned GatewayClasses.
@@ -434,6 +558,10 @@ func BuildGraph(res *Resources) *Graph {
 	for _, s := range res.Secrets {
 		secretsByKey[s.Namespace+"/"+s.Name] = s
 	}
+	configmapsByKey := map[string]*corev1.ConfigMap{}
+	for _, cm := range res.ConfigMaps {
+		configmapsByKey[cm.Namespace+"/"+cm.Name] = cm
+	}
 	servicesByKey := map[string]*corev1.Service{}
 	for _, svc := range res.Services {
 		servicesByKey[svc.Namespace+"/"+svc.Name] = svc
@@ -446,11 +574,46 @@ func BuildGraph(res *Resources) *Graph {
 	// exist in the namespace of the referenced object, ReferenceGrant spec).
 	grantsByNamespace := indexReferenceGrants(res.ReferenceGrants)
 
+	// 2b. Per-Gateway annotations: legacy-namespace fallback +
+	// deprecation warnings (v0.2.0 one-version compatibility,
+	// DESIGN-multinode-addresses.md §0) and the flag-gated escape-hatch
+	// annotations (§5). Recorded as graph warnings — BuildGraph stays
+	// pure; the reconciler logs them.
+	for _, gw := range g.Gateways {
+		nsName := gw.Resource.Namespace + "/" + gw.Resource.Name
+		var legacy bool
+		if gw.PublishAddresses, legacy = annotationValue(gw.Resource.Annotations, PublishAddressesAnnotation); legacy {
+			g.warn(fmt.Sprintf("Gateway %s: annotation %s%s is deprecated; use %s (support removed in v0.3.0)",
+				nsName, LegacyAnnotationPrefix, "publish-addresses", PublishAddressesAnnotation))
+		}
+		if _, legacy = annotationValue(gw.Resource.Annotations, ListenAddressesAnnotation); legacy {
+			g.warn(fmt.Sprintf("Gateway %s: annotation %s%s is deprecated; use %s (support removed in v0.3.0)",
+				nsName, LegacyAnnotationPrefix, "listen-addresses", ListenAddressesAnnotation))
+		}
+		if v := gw.Resource.Annotations[ServerSnippetAnnotation]; v != "" {
+			if opts.AllowNginxSnippets {
+				gw.RawServerSnippet = v
+			} else {
+				g.warn(fmt.Sprintf("Gateway %s: annotation %s is ignored (--dangerously-allow-nginx-snippets is off)",
+					nsName, ServerSnippetAnnotation))
+			}
+		}
+		if raw := gw.Resource.Annotations[ExtraFilesAnnotation]; raw != "" {
+			if opts.AllowExtraFiles {
+				resolveExtraFiles(gw, raw, configmapsByKey, secretsByKey, g.warn)
+			} else {
+				g.warn(fmt.Sprintf("Gateway %s: annotation %s is ignored (--dangerously-allow-extra-files is off)",
+					nsName, ExtraFilesAnnotation))
+			}
+		}
+	}
+
 	// 3. Listener resolution.
 	for _, gw := range g.Gateways {
 		for i := range gw.Resource.Spec.Listeners {
 			li := resolveListener(gw.Resource, i, secretsByKey, grantsByNamespace)
 			li.Gateway = gw
+			li.RawServerSnippet = gw.RawServerSnippet
 			gw.Listeners = append(gw.Listeners, li)
 		}
 	}
@@ -485,7 +648,11 @@ func BuildGraph(res *Resources) *Graph {
 	}
 	for _, r := range routes {
 		ri := &RouteInfo{Resource: r}
-		resolveRoute(ri, gatewaysByKey, slicesByService, servicesByKey, namespacesByName, grantsByNamespace)
+		if v := r.Annotations[LocationSnippetAnnotation]; v != "" && !opts.AllowNginxSnippets {
+			g.warn(fmt.Sprintf("HTTPRoute %s/%s: annotation %s is ignored (--dangerously-allow-nginx-snippets is off)",
+				r.Namespace, r.Name, LocationSnippetAnnotation))
+		}
+		resolveRoute(ri, gatewaysByKey, slicesByService, servicesByKey, namespacesByName, grantsByNamespace, opts)
 		g.Routes = append(g.Routes, ri)
 	}
 	return g
@@ -946,9 +1113,11 @@ func looksLikeKeyPEM(data []byte) bool {
 		bytes.Contains(data, []byte("PRIVATE KEY-----"))
 }
 
-// listenAddresses parses the listen-addresses annotation (§3.1).
+// listenAddresses parses the listen-addresses annotation (§3.1), reading
+// the new hng.victrid.dev/ namespace with the one-version legacy fallback
+// (annotationValue; the deprecation warning is recorded by BuildGraph).
 func listenAddresses(gw *gatewayv1.Gateway) []string {
-	raw := gw.Annotations[ListenAddressesAnnotation]
+	raw, _ := annotationValue(gw.Annotations, ListenAddressesAnnotation)
 	if raw == "" {
 		return nil
 	}
@@ -959,6 +1128,112 @@ func listenAddresses(gw *gatewayv1.Gateway) []string {
 		}
 	}
 	return out
+}
+
+// resolveExtraFiles resolves the hng.victrid.dev/extra-files annotation
+// (DESIGN-multinode-addresses.md §5) into GatewayInfo.ExtraFiles entries.
+// Refs are "configmap:ns/name" / "secret:ns/name", comma-separated;
+// a ref without a namespace part defaults to the Gateway's namespace.
+//
+// Policy (flag-gated escape hatch, not a spec path — keep it simple):
+//   - cross-namespace refs are DENIED (no ReferenceGrant machinery): a ref
+//     whose namespace differs from the Gateway's is skipped with a warning;
+//   - missing / wrong-kind / malformed refs are skipped with a warning;
+//   - each surviving ref contributes one entry per data key
+//     (ConfigMap data + binaryData, Secret data), keyed by
+//     "files/<ns>_<name>/<key>"; keys containing "/" or equal to "." / ".."
+//     are skipped (defense in depth — the API server already restricts
+//     ConfigMap/Secret keys to [-._a-zA-Z0-9]+).
+//
+// Determinism: refs resolve in annotation order, keys in lexical order;
+// duplicate paths (same ref listed twice) collapse to the first entry.
+func resolveExtraFiles(gw *GatewayInfo, raw string,
+	configmaps map[string]*corev1.ConfigMap, secrets map[string]*corev1.Secret,
+	warn func(string)) {
+	nsName := gw.Resource.Namespace + "/" + gw.Resource.Name
+	seen := map[string]struct{}{}
+	addKey := func(refNS, refName, key string, content []byte) {
+		rel := "files/" + refNS + "_" + refName + "/" + key
+		if _, dup := seen[rel]; dup {
+			return
+		}
+		seen[rel] = struct{}{}
+		gw.ExtraFiles = append(gw.ExtraFiles, ExtraFileEntry{RelPath: rel, Content: content})
+	}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kind, ref, ok := strings.Cut(part, ":")
+		if !ok || ref == "" {
+			warn(fmt.Sprintf("Gateway %s: extra-files ref %q is malformed (want configmap:ns/name or secret:ns/name); skipped", nsName, part))
+			continue
+		}
+		refNS, name := gw.Resource.Namespace, ref
+		if r, rest, hasNS := strings.Cut(ref, "/"); hasNS {
+			refNS, name = r, strings.TrimSpace(rest)
+		}
+		if refNS != gw.Resource.Namespace {
+			warn(fmt.Sprintf("Gateway %s: extra-files ref %q is cross-namespace; only refs in %s are allowed; skipped", nsName, part, gw.Resource.Namespace))
+			continue
+		}
+		if name == "" {
+			warn(fmt.Sprintf("Gateway %s: extra-files ref %q has an empty name; skipped", nsName, part))
+			continue
+		}
+		var keys []string
+		contentOf := func(key string) ([]byte, bool) { return nil, false }
+		switch kind {
+		case "configmap":
+			cm, found := configmaps[refNS+"/"+name]
+			if !found {
+				warn(fmt.Sprintf("Gateway %s: extra-files ref ConfigMap %s/%s not found; skipped", nsName, refNS, name))
+				continue
+			}
+			for k := range cm.Data {
+				keys = append(keys, k)
+			}
+			for k := range cm.BinaryData {
+				if _, dup := cm.Data[k]; !dup {
+					keys = append(keys, k)
+				}
+			}
+			contentOf = func(key string) ([]byte, bool) {
+				if v, ok := cm.Data[key]; ok {
+					return []byte(v), true
+				}
+				v, ok := cm.BinaryData[key]
+				return v, ok
+			}
+		case "secret":
+			s, found := secrets[refNS+"/"+name]
+			if !found {
+				warn(fmt.Sprintf("Gateway %s: extra-files ref Secret %s/%s not found; skipped", nsName, refNS, name))
+				continue
+			}
+			for k := range s.Data {
+				keys = append(keys, k)
+			}
+			contentOf = func(key string) ([]byte, bool) {
+				v, ok := s.Data[key]
+				return v, ok
+			}
+		default:
+			warn(fmt.Sprintf("Gateway %s: extra-files ref %q has unsupported kind %q (want configmap or secret); skipped", nsName, part, kind))
+			continue
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if strings.ContainsAny(k, "/\\\x00") || k == "." || k == ".." {
+				warn(fmt.Sprintf("Gateway %s: extra-files key %q of %s %s/%s cannot be a path segment; skipped", nsName, k, kind, refNS, name))
+				continue
+			}
+			if content, ok := contentOf(k); ok {
+				addKey(refNS, name, k, content)
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,7 +1459,8 @@ func hostnameIntersection(routeHostnames []gatewayv1.Hostname, listener *gateway
 
 func resolveRoute(ri *RouteInfo, gateways map[string]*GatewayInfo,
 	slices map[string][]*discoveryv1.EndpointSlice, services map[string]*corev1.Service,
-	namespaces map[string]*corev1.Namespace, grants map[string][]*gatewayv1.ReferenceGrant) {
+	namespaces map[string]*corev1.Namespace, grants map[string][]*gatewayv1.ReferenceGrant,
+	opts GraphOptions) {
 	route := ri.Resource
 
 	// Rules first: the route-wide backendRef resolution (GEP-1364) feeds
@@ -1198,6 +1474,15 @@ func resolveRoute(ri *RouteInfo, gateways map[string]*GatewayInfo,
 		ri.Rules = append(ri.Rules, rule)
 		if rule.refFailReason != "" && !refFail {
 			refFail, refReason, refMsg = true, rule.refFailReason, rule.refFailMsg
+		}
+	}
+
+	// Route-level escape-hatch annotation (DESIGN-multinode-addresses.md
+	// §5): applies to every location generated from this route's rules.
+	// Flag-gated; the ignored-with-warning case is recorded by BuildGraph.
+	if opts.AllowNginxSnippets {
+		for _, rule := range ri.Rules {
+			rule.RawSnippet = route.Annotations[LocationSnippetAnnotation]
 		}
 	}
 	refsOK, refsReason, refsMsg := true, string(gatewayv1.RouteReasonResolvedRefs), ""

@@ -226,13 +226,17 @@ Product features implemented (spec-first, Gateway API v1):
    distinctness rules apply to the merged set) are separated by assigning
    each Gateway its own 127.0.0.N bind (`127.0.0.(8 + hash(ns/name) mod 232)`,
    linear probing; hash-stable so unrelated Gateways never shift another's
-   address). Explicit `listen-addresses` annotations win; unresolvable
+   address). Explicit `listen-addresses` annotations (v0.2.0:
+   `hng.victrid.dev/listen-addresses`, legacy spelling still read with a
+   deprecation warning) win; unresolvable
    collisions keep the §3.2 both-sides-Conflicted behaviour. This replaces
    the round-2 BIND SHIM with a product feature.
 4. **Gateway status.addresses** (`translate.go StatusAddresses`,
    `internal/status/writer.go`, `cmd/host-nginx-gateway/addresses.go`):
    controller-written, type IPAddress. Source precedence:
-   `gateway.host-nginx/publish-addresses` annotation → `--publish-addresses`
+   `hng.victrid.dev/publish-addresses` annotation (v0.2.0 renamed from
+   `gateway.host-nginx/publish-addresses`; the legacy spelling is still
+   read with a deprecation warning) → `--publish-addresses`
    flag → auto-assigned loopback → node primary IP (`HNG_NODE_IP` downward
    API in the DaemonSet form, else interface-route detection). Replaces the
    round-2 ADDRESS SHIM.

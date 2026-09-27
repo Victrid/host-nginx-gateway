@@ -70,6 +70,12 @@ spec:
             - --nginx-pid={{ .Values.nginx.pidPath }}
             - --nginx-binary={{ .Values.nginx.binary }}
             - --healthz-addr={{ .Values.healthzAddr }}
+            {{- if .Values.dangerouslyAllowNginxSnippets }}
+            - --dangerously-allow-nginx-snippets
+            {{- end }}
+            {{- if .Values.dangerouslyAllowExtraFiles }}
+            - --dangerously-allow-extra-files
+            {{- end }}
             {{- range .Values.args }}
             - {{ . | quote }}
             {{- end }}

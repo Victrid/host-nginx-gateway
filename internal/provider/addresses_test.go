@@ -12,30 +12,30 @@ import (
 )
 
 func TestStatusAddresses_Precedence(t *testing.T) {
-	annotated := testGateway("default", "gw", "c", 1, plainListener("web", 80, host("a.com")))
-	annotated.Annotations = map[string]string{PublishAddressesAnnotation: "203.0.113.7"}
+	// StatusAddresses reads gw.PublishAddresses — the value BuildGraph
+	// resolves from the annotation (new namespace first, legacy fallback).
 	plain := testGateway("default", "gw3", "c", 1, plainListener("web", 80, host("c.com")))
 
 	cases := []struct {
-		gw       *gatewayv1.Gateway
+		publish  string
 		autoAddr string
 		explicit []string
 		fallback []string
 		want     []string
 	}{
 		// 1. The Gateway annotation wins over everything.
-		{annotated, "", []string{"198.51.100.1"}, []string{"192.0.2.9"}, []string{"203.0.113.7"}},
+		{"203.0.113.7", "", []string{"198.51.100.1"}, []string{"192.0.2.9"}, []string{"203.0.113.7"}},
 		// 2. Then the explicit --publish-addresses list.
-		{plain, "", []string{"198.51.100.1"}, []string{"192.0.2.9"}, []string{"198.51.100.1"}},
+		{"", "", []string{"198.51.100.1"}, []string{"192.0.2.9"}, []string{"198.51.100.1"}},
 		// 3. Then the auto-assigned loopback (the truth of where it binds).
-		{plain, "127.0.0.42", nil, []string{"192.0.2.9"}, []string{"127.0.0.42"}},
+		{"", "127.0.0.42", nil, []string{"192.0.2.9"}, []string{"127.0.0.42"}},
 		// 4. Then the fallback (detected node IP).
-		{plain, "", nil, []string{"192.0.2.9"}, []string{"192.0.2.9"}},
+		{"", "", nil, []string{"192.0.2.9"}, []string{"192.0.2.9"}},
 		// 5. Nothing known → leave status untouched (nil).
-		{plain, "", nil, nil, nil},
+		{"", "", nil, nil, nil},
 	}
 	for i, tc := range cases {
-		info := &GatewayInfo{Resource: tc.gw, AutoAddress: tc.autoAddr}
+		info := &GatewayInfo{Resource: plain, AutoAddress: tc.autoAddr, PublishAddresses: tc.publish}
 		got := info.StatusAddresses(tc.explicit, tc.fallback)
 		if tc.want == nil {
 			if got != nil {

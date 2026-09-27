@@ -47,12 +47,14 @@ const (
 // config carries the parsed flag values; a struct (instead of main-locals)
 // keeps run() testable.
 type config struct {
-	nginxConfDir     string
-	nginxBinary      string
-	nginxPID         string
-	healthzAddr      string
-	publishAddresses string
-	nginxErrorLog    string
+	nginxConfDir       string
+	nginxBinary        string
+	nginxPID           string
+	healthzAddr        string
+	publishAddresses   string
+	nginxErrorLog      string
+	allowNginxSnippets bool
+	allowExtraFiles    bool
 }
 
 func main() {
@@ -80,14 +82,31 @@ func main() {
 		"Comma-separated IPs to report in Gateway status.addresses "+
 			"(DESIGN.md §3.4). Default: detect the node's primary IP "+
 			"(HNG_NODE_IP env in the DaemonSet form, else the interface "+
-			"route default). A Gateway's gateway.host-nginx/publish-addresses "+
-			"annotation overrides this per Gateway.")
+			"route default). A Gateway's hng.victrid.dev/publish-addresses "+
+			"annotation overrides this per Gateway (the legacy "+
+			"gateway.host-nginx/publish-addresses spelling is still read "+
+			"with a deprecation warning and removed in v0.3.0).")
 	fs.StringVar(&cfg.nginxErrorLog, "nginx-error-log", "",
 		"Path to the error log used for reload-effect verification and "+
 			"emitted as the http-context error_log directive. Defaults to "+
 			"<nginx-conf-dir>/error.log (inside the owned directory — the "+
 			"host nginx may otherwise log to stderr only). The literal "+
 			"value \"off\" disables the verification.")
+	// Danger flags (DESIGN-multinode-addresses.md §5): escape hatches for
+	// raw nginx snippets and extra files. Off by default; annotation
+	// writers are trusted at cluster-admin level (threat model in the
+	// design doc). nginx -t + rollback remain the safety net.
+	fs.BoolVar(&cfg.allowNginxSnippets, "dangerously-allow-nginx-snippets", false,
+		"Escape hatch: honor the hng.victrid.dev/server-snippet (Gateway) "+
+			"and hng.victrid.dev/location-snippet (HTTPRoute) annotations — "+
+			"raw nginx config injected verbatim into server/location blocks. "+
+			"Annotation writers must be trusted at cluster-admin level.")
+	fs.BoolVar(&cfg.allowExtraFiles, "dangerously-allow-extra-files", false,
+		"Escape hatch: honor the hng.victrid.dev/extra-files Gateway "+
+			"annotation — same-namespace ConfigMap/Secret data keys "+
+			"materialised under <nginx-conf-dir>/files/ and referenceable "+
+			"from snippets via @<key>@ placeholders. Annotation writers "+
+			"must be trusted at cluster-admin level.")
 	_ = fs.Parse(os.Args[1:])
 
 	switch {
@@ -111,7 +130,9 @@ func main() {
 		"nginx-pid", cfg.nginxPID,
 		"healthz-addr", cfg.healthzAddr,
 		"nginx-main-config", nginxMainConfig,
-		"nginx-error-log", cfg.nginxErrorLog)
+		"nginx-error-log", cfg.nginxErrorLog,
+		"dangerously-allow-nginx-snippets", cfg.allowNginxSnippets,
+		"dangerously-allow-extra-files", cfg.allowExtraFiles)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -189,11 +210,13 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		return fmt.Errorf("dataplane publisher: %w", err)
 	}
 	certs := dataplane.NewCertsManager(filepath.Join(cfg.nginxConfDir, "certs"))
+	files := dataplane.NewFilesManager(cfg.nginxConfDir)
 
 	applier := &DataplaneApplier{
 		ConfDir:      cfg.nginxConfDir,
 		Nginx:        nginx,
 		Certs:        certs,
+		Files:        files,
 		Publisher:    publisher,
 		Metrics:      metrics,
 		Log:          logger.WithName("dataplane"),
@@ -209,6 +232,8 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		Applier:                applier,
 		PublishAddresses:       parseAddressList(cfg.publishAddresses),
 		FallbackAddresses:      detectPublishAddresses(),
+		AllowNginxSnippets:     cfg.allowNginxSnippets,
+		AllowExtraFiles:        cfg.allowExtraFiles,
 		MetricsBindAddress:     "0",
 		HealthProbeBindAddress: "0",
 		Log:                    logger.WithName("provider"),

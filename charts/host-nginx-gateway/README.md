@@ -44,8 +44,9 @@ rewrites files under the host's `/etc/nginx/conf.d/k8s-gw`.
 * The controller binds **no ports** — the HOST nginx (outside Kubernetes)
   does all listening; no conflicts with in-cluster service load balancers.
 * Gateways should use ports not already bound by the host's own servers;
-  use the `gateway.host-nginx/listen-addresses` annotation to bind
-  specific addresses.
+  use the `hng.victrid.dev/listen-addresses` annotation to bind
+  specific addresses (the legacy `gateway.host-nginx/listen-addresses`
+  spelling is still read with a deprecation warning until v0.3.0).
 * **WARNING — run at most ONE controller instance per host.** Two
   instances (a second release of this chart, or a manually started
   binary) are both full writers of
@@ -64,6 +65,8 @@ rewrites files under the host's `/etc/nginx/conf.d/k8s-gw`.
 | `nodeSelector` / `tolerations` / `affinity` | `{}` | Pin to the node(s) running the host nginx |
 | `resources` | `{}` | Container resources |
 | `args` | `[]` | Extra controller args appended after the templated ones |
+| `dangerouslyAllowNginxSnippets` | `false` | Pass `--dangerously-allow-nginx-snippets`: honor `hng.victrid.dev/server-snippet` (Gateway) / `hng.victrid.dev/location-snippet` (HTTPRoute) raw nginx snippets. Annotation writers must be trusted at cluster-admin level |
+| `dangerouslyAllowExtraFiles` | `false` | Pass `--dangerously-allow-extra-files`: honor `hng.victrid.dev/extra-files` (Gateway) — same-namespace ConfigMap/Secret data keys materialised under `<nginx.confDir>/conf.d/k8s-gw/files/` |
 | `healthzAddr` | `127.0.0.1:9125` | In-pod healthz/metrics listener (keep off data-plane ports) |
 | `probes.enabled` | `true` | exec-based liveness probe against healthz |
 | `podSecurityContext` / `securityContext` | uid 0 / privileged | See Security above |

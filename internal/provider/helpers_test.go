@@ -163,11 +163,13 @@ func build(t *testing.T, objs ...any) *Graph {
 			res.Namespaces = append(res.Namespaces, v)
 		case *gatewayv1.ReferenceGrant:
 			res.ReferenceGrants = append(res.ReferenceGrants, v)
+		case *corev1.ConfigMap:
+			res.ConfigMaps = append(res.ConfigMaps, v)
 		default:
 			t.Fatalf("unsupported test object %T", o)
 		}
 	}
-	return BuildGraph(res)
+	return BuildGraph(res, GraphOptions{})
 }
 
 func gatewayOf(t *testing.T, g *Graph, ns, name string) *GatewayInfo {
