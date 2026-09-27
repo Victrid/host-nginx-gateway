@@ -1,0 +1,45 @@
+{{- if .Values.rbac.create }}
+# Least-privilege RBAC (DESIGN.md §7/§8):
+# watches + lists on the Gateway API / core / discovery resources the
+# full reconciler needs, and status-subresource updates for the
+# three-layer write-back (§3.4). No create/delete/patch anywhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "host-nginx-gateway.name" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "host-nginx-gateway.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets", "services", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - "gatewayclasses/status"
+      - "gateways/status"
+      - "httproutes/status"
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "host-nginx-gateway.name" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "host-nginx-gateway.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "host-nginx-gateway.name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "host-nginx-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,28 @@
+# Scenario 6 base: a single healthy Gateway + route (rollback scenario then
+# breaks it with an invalid TLS Secret).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw-a
+  namespace: e2e
+spec:
+  gatewayClassName: host-nginx
+  listeners:
+    - name: web
+      port: 8080
+      protocol: HTTP
+      hostname: ok.example.com
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend
+  namespace: e2e
+spec:
+  parentRefs:
+    - name: gw-a
+  hostnames: ["ok.example.com"]
+  rules:
+    - backendRefs:
+        - name: backend
+          port: 8080

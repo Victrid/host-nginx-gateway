@@ -1,0 +1,28 @@
+# Scenario 5: cross-Gateway conflict (DESIGN.md §3.2) — same port + same
+# hostname on two Gateways: BOTH listeners must be Conflicted=True
+# (HostnameConflict), neither gets a server block, no name tie-breaking.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw-a
+  namespace: e2e
+spec:
+  gatewayClassName: host-nginx
+  listeners:
+    - name: web
+      port: 9080
+      protocol: HTTP
+      hostname: conflict.example.com
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw-b
+  namespace: e2e
+spec:
+  gatewayClassName: host-nginx
+  listeners:
+    - name: web
+      port: 9080
+      protocol: HTTP
+      hostname: conflict.example.com

@@ -1,0 +1,19 @@
+v0.1.1: nsenter netns fix, admin-owned default servers, per-group TLS certs
+
+- fix: nginx invocations now enter the host network namespace too
+  (nsenter -t 1 -n -m) — nginx -t bind probes previously ran in the pod
+  netns and failed with error 99 on host-specific addresses (e.g. node
+  IPv6); reload verification is now errno-aware (EADDRINUSE on
+  master-held sockets tolerated, unassignable addresses roll back)
+- change: the controller no longer inserts synthetic default-server
+  blocks; unmatched hosts follow nginx default-server rules owned by the
+  host administrator (conformance/e2e environments pre-configure default
+  servers via a script-managed fixture, docs/DESIGN-multinode-addresses.md
+  records the policy)
+- fix: TLS certificates are tracked per hostname-group instead of
+  latched per socket — two Gateways (or listeners) sharing a port with
+  disjoint hostnames now each render their own ssl_certificate; same
+  hostname + different certs marks both listeners Conflicted
+- docs: mult-node spec.addresses design outline, danger-flag escape
+  hatches (next round), annotation namespace migration to
+  hng.victri.dev, default-server FAQ
