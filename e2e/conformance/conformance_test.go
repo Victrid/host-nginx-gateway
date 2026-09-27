@@ -23,6 +23,14 @@ Former adaptations, now PRODUCT features (round 5):
     failure detection + rollback), the 443 TLS base Gateway reconciles
     cleanly alongside the host nginx (which owns no 443 here).
 
+Round 9: the controller no longer injects synthetic default servers
+(DESIGN.md §3.3) — unmatched-host requests are answered by the
+environment's own default servers, installed by
+e2e/install-default-server-fixture.sh exactly like an administrator's
+nginx.conf would. The harness only REFRESHES that script-managed fixture
+onto the suite certificate after the base Gateways are programmed (see
+refreshDefaultServerFixture); it never writes nginx configuration itself.
+
 Everything else — GatewayClass/controllerName wiring, supported/exempt
 features, skipped tests — is passed via the standard suite flags from
 e2e/run-conformance.sh. See BASELINE.md for the recorded baseline.
@@ -33,6 +41,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -134,8 +144,35 @@ func TestConformance(t *testing.T) {
 	// harness annotations or injectors are needed anymore.
 	waitBaseGatewaysProgrammed(t, cSuite)
 
+	// Default-server fixture refresh: the controller never injects default
+	// servers (DESIGN.md §3.3) — unmatched-host requests are answered by
+	// the environment's own default servers, installed by
+	// e2e/install-default-server-fixture.sh exactly like an administrator
+	// would. The script-managed fixture starts on a self-signed
+	// certificate; now that the base Gateways are programmed the suite's
+	// TLS certificate is materialized under
+	// /etc/nginx/conf.d/k8s-gw/certs/, so re-apply the fixture to present
+	// it on the 443 default sockets (HTTPRouteHTTPSListener verifies the
+	// server certificate even for its unmatched-SNI 404 case).
+	refreshDefaultServerFixture(t)
+
 	err = cSuite.Run(t, tests.ConformanceTests)
 	require.NoError(t, err)
+}
+
+// refreshDefaultServerFixture re-applies the script-managed default-server
+// fixture (e2e/install-default-server-fixture.sh). It is idempotent and
+// reloads nginx only when the fixture content changed (first run: fixture
+// certificate → suite certificate on the 443 default blocks).
+func refreshDefaultServerFixture(t *testing.T) {
+	t.Helper()
+	script := filepath.Join("..", "install-default-server-fixture.sh")
+	cmd := exec.Command("bash", script, "--wait-suite-cert")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("default-server fixture refresh failed: %v\n%s", err, out)
+	}
+	t.Logf("default-server fixture: %s", strings.TrimSpace(string(out)))
 }
 
 // summarizeReport prints the per-profile pass/fail/skip counts so the shell

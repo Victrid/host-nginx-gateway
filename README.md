@@ -17,11 +17,47 @@ This project is not affiliated with nginx or Kubernetes.
 > **One Controller per Node**:  The controller claims `/etc/nginx/conf.d/k8s-gw/` exclusively; do not run two instances against the same nginx. Using DaemonSet can guarantee this. 
 
 ## Quick Start
+
+Values you need to take care of:
+
+1. Host nginx's configuration
+```yaml
+    nginx:
+    confDir: /etc/nginx
+    pidPath: /host/run/nginx.pid
+    binary: /usr/sbin/nginx # Sometimes /usr/bin/nginx
+```
+2. `nodeSelector`: if you deploy it over multiple devices, pin the node running host Nginx.
+
+Full Helm values are documented in [charts/host-nginx-gateway/README.md](charts/host-nginx-gateway/README.md).
+
 ```bash
 # Install Gateway API CRDs
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+
+helm repo add host-nginx-gateway https://victrid.github.io/host-nginx-gateway/
+helm upgrade --install my-host-nginx-gateway host-nginx-gateway/host-nginx-gateway -n host-nginx-gateway --create-namespace -f <Your Values YAML>
 ```
-Full Helm values are documented in [charts/host-nginx-gateway/README.md](charts/host-nginx-gateway/README.md).
+
+Nginx configuration:
+
+Add following line to Nginx server's main conf and run `nginx -s reload` in your host:
+```
+http {
+    include <nginx.confDir>/conf.d/k8s-gw/*.conf;
+    ...
+}
+```
+
+It's suggested to add a catch-all server, to meet Gateway API's expectation; You should configure this on your own.
+```
+server {
+    listen 443 ssl http2;
+    server_name _;
+    ...
+}
+```
+
 
 ## Prerequisites
 
@@ -68,6 +104,30 @@ k3s API ──watch──► Full Reconciler ──► graph (IR) ──► text
 ```
 
 The controller runs as a DaemonSet pod, watches Gateway resources through its in-cluster ServiceAccount, and renders the desired nginx configuration from an internal IR. Publishing validates against a temporary copy of your real `nginx.conf` (your config is never modified), replaces files atomically, signals the host nginx through the host mount namespace, and verifies new listen sockets actually came up — rolling back automatically on failure.
+
+### Default servers and unknown hosts (FAQ)
+
+**The controller never injects a default server.** Your nginx.conf owns the default server for every port nginx listens on. Every server block the controller emits is backed by a real route claim (Gateway listeners/routes); when no route claims a catch-all (hostname-less) position, the controller emits no block for it at all.
+
+Consequence: if you have not declared a default server yourself, nginx falls back to its own rule — the *first* server block listed for that socket becomes the default. Requests for unknown/incorrect `Host` headers may then be served by one of your Gateway routes. If you care about this (e.g. because the controller shares the host with other services), declare your own default server in `nginx.conf`, e.g.:
+
+```nginx
+server {
+    listen 80 default_server;
+    server_name _;
+    return 404;
+}
+# For HTTPS listeners you also need one per TLS port, with a certificate:
+# server {
+#     listen 443 ssl default_server;
+#     server_name _;
+#     ssl_certificate /etc/nginx/snakeoil.pem;
+#     ssl_certificate_key /etc/nginx/snakeoil.key;
+#     return 404;
+# }
+```
+
+This is intentional for co-existence: the controller treats default-server policy as the host administrator's business, not its own.
 
 ## Limitations
 
