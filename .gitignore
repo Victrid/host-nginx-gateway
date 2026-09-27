@@ -12,3 +12,7 @@ e2e/conformance/report.yaml
 # Local env
 .env
 .*.swp
+
+# design docs (not tracked)
+DESIGN.md
+docs/
