@@ -2,11 +2,14 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	logr "github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/Victrid/HostNginxGateway/internal/contract"
 	"github.com/Victrid/HostNginxGateway/internal/errs"
+	"github.com/Victrid/HostNginxGateway/internal/nodeaddrs"
 )
 
 // countingClient counts status subresource writes issued through it.
@@ -250,6 +254,173 @@ func TestFullSync_NilApplierStaysPending(t *testing.T) {
 	if got := condByType(gw.Status.Conditions, "Programmed"); got.Status != metav1.ConditionFalse ||
 		got.Reason != string(gatewayv1.GatewayReasonPending) {
 		t.Fatalf("nil applier must surface Pending: %+v", got)
+	}
+}
+
+// fakeEvents records Eventf calls (the ListenerSkippedOnNode seam).
+type fakeEvents struct {
+	object  client.Object
+	reason  string
+	message string
+}
+
+func (f *fakeEvents) Event(object runtime.Object, eventtype, reason, message string) {}
+func (f *fakeEvents) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+	if o, ok := object.(client.Object); ok {
+		f.object, f.reason, f.message = o, reason, fmt.Sprintf(messageFmt, args...)
+	}
+}
+func (f *fakeEvents) AnnotatedEventf(object runtime.Object, annotations map[string]string,
+	eventtype, reason, messageFmt string, args ...interface{}) {
+}
+
+// nodeFingerprint is a static NodeAddressSource over one Set.
+type nodeFingerprint struct{ set *nodeaddrs.Set }
+
+func (n nodeFingerprint) Current() *nodeaddrs.Set     { return n.set }
+func (n nodeFingerprint) OnChange(func())             {}
+func (n nodeFingerprint) Start(context.Context) error { return nil }
+
+// pinnedCluster is fullCluster with the "gw" Gateway pinned to an address
+// the test node does NOT hold.
+func pinnedCluster(addr string) []client.Object {
+	return []client.Object{
+		testClass("ours", ControllerName, 1),
+		testClass("theirs", "other.example.com/controller", 1),
+		testTLSSecret("default", "cert"),
+		func() *gatewayv1.Gateway {
+			gw := testGateway("default", "gw", "ours", 2,
+				plainListener("web", 80, nil),
+				tlsListener("secure", 443, nil, gatewayv1.HTTPSProtocolType, nil, "cert"),
+			)
+			gw.Spec.Addresses = []gatewayv1.GatewaySpecAddress{{Type: ptr(gatewayv1.IPAddressType), Value: addr}}
+			return gw
+		}(),
+		testGateway("default", "foreign", "theirs", 1, plainListener("web", 80, nil)),
+		testRoute("default", "r", 3, nil, []gatewayv1.ParentReference{gwParent("gw")},
+			pathBackendRule(gatewayv1.PathMatchPathPrefix, "/", "svc", 8080)),
+		testSlice("default", "svc", 8080, ptr(true), "10.0.0.1"),
+	}
+}
+
+// TestFullSync_ZeroOwnedGatewaysGetNoStatusWrite is the multinode
+// ownership MVP (DESIGN-multinode-addresses.md §3): a Gateway whose
+// spec.addresses this node does not hold is left COMPLETELY untouched —
+// no conditions, no listener entries, no addresses. The owning node
+// reports it instead.
+func TestFullSync_ZeroOwnedGatewaysGetNoStatusWrite(t *testing.T) {
+	c := newTestClient(t, pinnedCluster("198.51.100.7")...)
+	r := NewReconciler(c, &fakeApplier{}, time.Millisecond, logr.Discard())
+	r.NodeAddrs = nodeFingerprint{set: nodeaddrs.NewSet("192.0.2.10")}
+	r.NodeName = "node-a"
+	ev := &fakeEvents{}
+	r.Events = ev
+	var skipped int
+	r.OnListenersSkipped = func(n int) { skipped = n }
+
+	if err := r.FullSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var gw gatewayv1.Gateway
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "gw"}, &gw); err != nil {
+		t.Fatal(err)
+	}
+	if len(gw.Status.Conditions) != 0 || len(gw.Status.Listeners) != 0 || len(gw.Status.Addresses) != 0 {
+		t.Fatalf("not-owned Gateway must stay untouched: %+v", gw.Status)
+	}
+
+	// Observability: one ListenerSkippedOnNode event naming the node and
+	// the skipped address, plus the metrics counter.
+	if ev.object == nil || ev.reason != "ListenerSkippedOnNode" {
+		t.Fatalf("expected a ListenerSkippedOnNode event, got %+v", ev)
+	}
+	if !strings.Contains(ev.message, "node-a") || !strings.Contains(ev.message, "198.51.100.7") {
+		t.Fatalf("event must name the node and skipped addresses: %q", ev.message)
+	}
+	if skipped != 2 {
+		t.Fatalf("skipped counter = %d, want 2 (both listeners of the pinned Gateway)", skipped)
+	}
+
+	// The route parent status is spec-level and still written (it does
+	// not encode node ownership in the MVP).
+	var route gatewayv1.HTTPRoute
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "r"}, &route); err != nil {
+		t.Fatal(err)
+	}
+	if len(route.Status.Parents) != 1 {
+		t.Fatalf("route parents: %+v", route.Status.Parents)
+	}
+}
+
+// TestFullSync_PartialOwnershipWritesOnlyOwnedListeners: a Gateway with
+// two listeners pinned to different nodes writes status HERE only when it
+// owns at least one listener — and then reports only its own listeners.
+func TestFullSync_PartialOwnershipWritesOnlyOwnedListeners(t *testing.T) {
+	pinned := func(addr string) *gatewayv1.Gateway {
+		gw := testGateway("default", "gw", "ours", 1,
+			plainListener("web", 80, nil),
+			plainListener("metrics", 8080, nil),
+		)
+		gw.Spec.Addresses = []gatewayv1.GatewaySpecAddress{{Type: ptr(gatewayv1.IPAddressType), Value: addr}}
+		return gw
+	}
+	objs := append(pinnedCluster("198.51.100.7")[:3], pinned("198.51.100.7"))
+	objs = append(objs, testSlice("default", "svc", 8080, ptr(true), "10.0.0.1"))
+
+	// Node B holds 198.51.100.7: both listeners of "gw" are owned there.
+	cB := newTestClient(t, objs...)
+	rB := NewReconciler(cB, &fakeApplier{}, time.Millisecond, logr.Discard())
+	rB.NodeAddrs = nodeFingerprint{set: nodeaddrs.NewSet("198.51.100.7")}
+	rB.NodeName = "node-b"
+	if err := rB.FullSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var gwB gatewayv1.Gateway
+	_ = cB.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "gw"}, &gwB)
+	if len(gwB.Status.Listeners) != 2 || len(gwB.Status.Addresses) != 1 ||
+		gwB.Status.Addresses[0].Value != "198.51.100.7" {
+		t.Fatalf("owning node must report both listeners and the pinned address: %+v", gwB.Status)
+	}
+
+	// Node A holds nothing of "gw": no write at all (covered above for
+	// the zero-owned shape; here assert no double-owner churn by reusing
+	// the same cluster through a different fingerprint).
+	cA := newTestClient(t, objs...)
+	rA := NewReconciler(cA, &fakeApplier{}, time.Millisecond, logr.Discard())
+	rA.NodeAddrs = nodeFingerprint{set: nodeaddrs.NewSet("192.0.2.10")}
+	rA.NodeName = "node-a"
+	if err := rA.FullSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var gwA gatewayv1.Gateway
+	_ = cA.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "gw"}, &gwA)
+	if len(gwA.Status.Listeners) != 0 {
+		t.Fatalf("non-owning node must not write listener status: %+v", gwA.Status)
+	}
+}
+
+// TestFullSync_WildcardGatewayStaysOwnedUnderFingerprint: the
+// conformance-base-Gateway shape (wildcard listeners, auto-assigned
+// loopbacks) must keep writing status under a real node fingerprint —
+// the harness depends on it (e2e/conformance round split, v0.3.0).
+func TestFullSync_WildcardGatewayStaysOwnedUnderFingerprint(t *testing.T) {
+	c := newTestClient(t, fullCluster()...)
+	r := NewReconciler(c, &fakeApplier{}, time.Millisecond, logr.Discard())
+	r.NodeAddrs = nodeFingerprint{set: nodeaddrs.NewSet("192.0.2.10", "2001:db8::1")}
+
+	if err := r.FullSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var gw gatewayv1.Gateway
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "gw"}, &gw); err != nil {
+		t.Fatal(err)
+	}
+	if got := condByType(gw.Status.Conditions, "Programmed"); got.Status != metav1.ConditionTrue {
+		t.Fatalf("wildcard Gateway must program under a fingerprint: %+v", got)
+	}
+	if len(gw.Status.Listeners) != 2 {
+		t.Fatalf("listeners: %+v", gw.Status.Listeners)
 	}
 }
 

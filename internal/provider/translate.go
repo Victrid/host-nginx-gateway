@@ -224,8 +224,8 @@ func (g *Graph) Configuration() *contract.Configuration {
 			continue // rejected Gateway: no server blocks (InvalidParameters)
 		}
 		for _, li := range gw.Listeners {
-			if !li.Valid || li.Conflicted {
-				continue // §3.2: conflicted listeners get no server block
+			if !li.Valid || li.Conflicted || !li.Owned {
+				continue // §3.2 conflicts: no block; not owned: another node serves it
 			}
 			if li.CertFailed && li.CertData == nil {
 				continue // no resolvable certificate material: nothing to serve
@@ -1064,29 +1064,88 @@ func (gw *GatewayInfo) rejection() (reason, msg string, rejected bool) {
 	return "", "", false
 }
 
-// StatusAddresses computes the Gateway's status.addresses (Gateway API v1:
-// "the network addresses that have been assigned to the Gateway", DESIGN.md
-// §3.4). Precedence:
+// OwnedHere reports whether THIS node is responsible for the Gateway's
+// status (multinode ownership MVP, DESIGN-multinode-addresses.md §3):
+// a node writes Gateway status only for Gateways where it owns at least
+// one listener; a Gateway not owned here is left completely untouched
+// (another node — the one holding the addresses — reports it). Rejected
+// Gateways (invalid class parameters, unsupported infrastructure
+// parametersRef) are always ours: the rejection is spec-level,
+// node-independent and must surface from somewhere.
+func (gw *GatewayInfo) OwnedHere() bool {
+	if _, _, rejected := gw.rejection(); rejected {
+		return true
+	}
+	for _, li := range gw.Listeners {
+		if li.Owned {
+			return true
+		}
+	}
+	return false
+}
+
+// StatusAddresses computes the Gateway's status.addresses (Gateway API
+// v1: "the network addresses that have been assigned to the Gateway",
+// DESIGN.md §3.4; multinode derivation per DESIGN-multinode-addresses.md
+// §3). Precedence:
 //
-//  1. the Gateway's hng.victrid.dev/publish-addresses annotation
-//     (resolved by BuildGraph with the legacy-namespace fallback);
-//  2. the operator's explicit --publish-addresses list;
-//  3. the auto-assigned loopback bind (cross-Gateway listener separation);
-//  4. the caller-provided default (flag default: the node's primary IP).
+//  1. the operator's explicit --publish-addresses list (external
+//     override — e.g. a load balancer or NAT in front of the nodes);
+//  2. the addresses THIS node actually renders listen directives on for
+//     this Gateway (the post-intersection effective bind set of its
+//     owned, renderable listeners) — the truthful per-node slice; the
+//     auto-assigned per-Gateway loopback shows up here exactly as
+//     before;
+//  3. when any owned listener binds the wildcard, the caller-provided
+//     fallback (flag default: the node's primary IP) — a wildcard
+//     listener is reachable on every node address.
 //
 // An empty result means "nothing authoritative known" — the status writer
 // leaves any existing addresses untouched.
 func (gw *GatewayInfo) StatusAddresses(explicit, fallback []string) []gatewayv1.GatewayStatusAddress {
-	addrs := publishList(gw.PublishAddresses)
+	if len(explicit) > 0 {
+		return ipStatusAddresses(explicit)
+	}
+	var addrs []string
+	wildcard := false
+	seen := map[string]struct{}{}
+	for _, li := range gw.Listeners {
+		// Only listeners this node renders contribute their binds.
+		if !li.Owned || !li.Valid || li.Conflicted {
+			continue
+		}
+		if li.CertFailed && li.CertData == nil {
+			continue // no server block is generated for it
+		}
+		if len(li.Addresses) == 0 {
+			wildcard = true
+			continue
+		}
+		for _, a := range li.Addresses {
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			seen[a] = struct{}{}
+			addrs = append(addrs, a)
+		}
+	}
+	if wildcard {
+		for _, a := range fallback {
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			seen[a] = struct{}{}
+			addrs = append(addrs, a)
+		}
+	}
 	if len(addrs) == 0 {
-		addrs = explicit
+		return nil
 	}
-	if len(addrs) == 0 && gw.AutoAddress != "" {
-		addrs = []string{gw.AutoAddress}
-	}
-	if len(addrs) == 0 {
-		addrs = fallback
-	}
+	return ipStatusAddresses(addrs)
+}
+
+// ipStatusAddresses wraps plain address strings as typed status entries.
+func ipStatusAddresses(addrs []string) []gatewayv1.GatewayStatusAddress {
 	if len(addrs) == 0 {
 		return nil
 	}
@@ -1098,24 +1157,11 @@ func (gw *GatewayInfo) StatusAddresses(explicit, fallback []string) []gatewayv1.
 	return out
 }
 
-// publishList parses a comma-separated address list (annotation form).
-func publishList(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var out []string
-	for _, part := range strings.Split(raw, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
-// AnyListenerInvalid reports whether any listener of the Gateway is invalid.
+// AnyListenerInvalid reports whether any owned listener of the Gateway is
+// invalid (not-owned listeners are another node's business).
 func (gw *GatewayInfo) AnyListenerInvalid() bool {
 	for _, l := range gw.Listeners {
-		if !l.Valid {
+		if l.Owned && !l.Valid {
 			return true
 		}
 	}
@@ -1150,6 +1196,9 @@ func (gw *GatewayInfo) Conditions(apply ApplyResult) []metav1.Condition {
 
 	anyValid, anyInvalid := false, false
 	for _, l := range gw.Listeners {
+		if !l.Owned {
+			continue // not-owned listeners neither bind nor report here
+		}
 		if l.Valid {
 			anyValid = true
 		} else {
@@ -1202,7 +1251,10 @@ func (gw *GatewayInfo) Conditions(apply ApplyResult) []metav1.Condition {
 }
 
 // ListenerStatuses assembles status.listeners[] (layer 2b): one entry per
-// spec listener with Accepted / Conflicted / ResolvedRefs / Programmed.
+// OWNED spec listener with Accepted / Conflicted / ResolvedRefs /
+// Programmed. Listeners whose spec.addresses this node does not hold get
+// NO entry (multinode ownership MVP, DESIGN-multinode-addresses.md §3:
+// the node owning the addresses reports them).
 //
 //	Accepted      True/Accepted                  valid listener
 //	Accepted      False/Invalid                  port missing, tls misuse
@@ -1220,6 +1272,9 @@ func (gw *GatewayInfo) ListenerStatuses(apply ApplyResult) []gatewayv1.ListenerS
 	gen := gw.Resource.Generation
 	out := make([]gatewayv1.ListenerStatus, 0, len(gw.Listeners))
 	for _, li := range gw.Listeners {
+		if !li.Owned {
+			continue // not owned on this node: no listener status entry
+		}
 		ls := gatewayv1.ListenerStatus{Name: li.Spec.Name}
 		if _, msg, rejected := gw.rejection(); rejected {
 			// Listener under a rejected Gateway: not accepted, nothing

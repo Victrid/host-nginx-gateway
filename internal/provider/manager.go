@@ -9,6 +9,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -19,17 +20,22 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/Victrid/HostNginxGateway/internal/contract"
+	"github.com/Victrid/HostNginxGateway/internal/nodeaddrs"
 	"github.com/Victrid/HostNginxGateway/internal/status"
 )
 
@@ -54,13 +60,14 @@ type Options struct {
 	Applier Applier
 
 	// PublishAddresses is the operator's explicit status.addresses list
-	// (--publish-addresses, DESIGN.md §3.4). Empty per-Gateway resolution:
-	// the publish-addresses annotation wins, then this list, then the
-	// auto-assigned loopback, then FallbackAddresses. Empty everywhere
-	// leaves status.addresses untouched.
+	// (--publish-addresses, DESIGN.md §3.4) — the external override in
+	// the status.addresses derivation. Below it, addresses derive from
+	// the listens this node actually renders (spec.addresses
+	// intersection / auto-assigned loopback), and wildcard binds fall
+	// back to FallbackAddresses (the node's primary IP).
 	PublishAddresses []string
 
-	// FallbackAddresses is the last-resort status.addresses value (the
+	// FallbackAddresses is the wildcard-bind status.addresses value (the
 	// detected node primary IP). See PublishAddresses.
 	FallbackAddresses []string
 
@@ -75,6 +82,22 @@ type Options struct {
 	// Default false: the annotation is ignored with a warning.
 	AllowExtraFiles bool
 
+	// NodeAddrs supplies this node's address fingerprint for the
+	// multinode ownership model (DESIGN-multinode-addresses.md §2). The
+	// reconciler reads Current() at every full sync; fingerprint changes
+	// fire OnChange, which Run wires to a full-sync trigger. Nil disables
+	// filtering entirely (single-node semantics).
+	NodeAddrs NodeAddressSource
+
+	// NodeName identifies this node in ListenerSkippedOnNode events and
+	// logs (empty falls back to the pod hostname).
+	NodeName string
+
+	// OnListenersSkipped, when set, receives the number of listeners this
+	// node skipped per full sync because their spec.addresses are not
+	// present on the node (the cmd wires this into the /metrics counter).
+	OnListenersSkipped func(n int)
+
 	// MinSyncInterval is the minimum spacing between full syncs; defaults
 	// to 1s (DESIGN.md §7).
 	MinSyncInterval time.Duration
@@ -86,6 +109,16 @@ type Options struct {
 
 	// Log receives lifecycle and sync logging.
 	Log logr.Logger
+}
+
+// NodeAddressSource is the node address fingerprint seam: the current Set
+// (nil = unknown → own everything), a change callback (wired to a
+// full-sync trigger) and the periodic refresh loop (run as a manager
+// runnable). Implemented by *nodeaddrs.Prober.
+type NodeAddressSource interface {
+	Current() *nodeaddrs.Set
+	OnChange(func())
+	Start(ctx context.Context) error
 }
 
 // NewScheme builds the scheme used by the manager and fake clients in tests.
@@ -136,11 +169,39 @@ func Run(ctx context.Context, opts Options) error {
 	rec.FallbackAddresses = opts.FallbackAddresses
 	rec.AllowNginxSnippets = opts.AllowNginxSnippets
 	rec.AllowExtraFiles = opts.AllowExtraFiles
+	rec.NodeAddrs = opts.NodeAddrs
+	rec.NodeName = opts.NodeName
+	rec.Events = mgr.GetEventRecorderFor("host-nginx-gateway")
+	rec.OnListenersSkipped = opts.OnListenersSkipped
+
+	// Node address fingerprint → full-sync trigger: a fingerprint change
+	// enqueues a (content-free) request through a channel source; the
+	// reconciler ignores request content and rebuilds from the cache
+	// (DESIGN-multinode-addresses.md §2 "变化时触发全量 reconcile").
+	var nodeAddrSource source.Source
+	if opts.NodeAddrs != nil {
+		ch := make(chan event.TypedGenericEvent[reconcile.Request], 1)
+		opts.NodeAddrs.OnChange(func() {
+			select {
+			case ch <- event.TypedGenericEvent[reconcile.Request]{}:
+			default: // a pending trigger already covers this change
+			}
+		})
+		nodeAddrSource = source.Channel(ch, handler.TypedFuncs[reconcile.Request, reconcile.Request]{
+			GenericFunc: func(_ context.Context, _ event.TypedGenericEvent[reconcile.Request],
+				q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				q.Add(reconcile.Request{})
+			},
+		})
+		if err := mgr.Add(manager.RunnableFunc(opts.NodeAddrs.Start)); err != nil {
+			return fmt.Errorf("provider: node address prober: %w", err)
+		}
+	}
 
 	// Full-reconcile controller: every event on any watched type enqueues a
 	// full sync; the request itself is ignored. MaxConcurrentReconciles=1
 	// keeps full syncs serialized (the graph is rebuilt from scratch).
-	err = ctrl.NewControllerManagedBy(mgr).
+	blder := ctrl.NewControllerManagedBy(mgr).
 		Named("host-nginx-gateway-full-sync").
 		For(&gatewayv1.GatewayClass{}).
 		Watches(&gatewayv1.Gateway{}, &handler.EnqueueRequestForObject{}).
@@ -155,8 +216,11 @@ func Run(ctx context.Context, opts Options) error {
 			MaxConcurrentReconciles: 1,
 			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](
 				5*time.Millisecond, time.Minute),
-		}).
-		Complete(rec)
+		})
+	if nodeAddrSource != nil {
+		blder = blder.WatchesRawSource(nodeAddrSource)
+	}
+	err = blder.Complete(rec)
 	if err != nil {
 		return fmt.Errorf("provider: setup controller: %w", err)
 	}
@@ -186,6 +250,15 @@ type Reconciler struct {
 	// annotations (see Options; DESIGN-multinode-addresses.md §5).
 	AllowNginxSnippets bool
 	AllowExtraFiles    bool
+
+	// NodeAddrs is this node's address fingerprint seam (nil = no
+	// fingerprint, single-node semantics). NodeName names this node in
+	// ListenerSkippedOnNode events. Events is the Gateway event recorder
+	// (nil-safe). OnListenersSkipped feeds the /metrics counter (nil-safe).
+	NodeAddrs          NodeAddressSource
+	NodeName           string
+	Events             record.EventRecorder
+	OnListenersSkipped func(n int)
 
 	gate *syncGate
 }
@@ -220,6 +293,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 // FullSync runs one complete pipeline pass:
 // list → graph → translate → apply → classify → status write-back.
 func (r *Reconciler) FullSync(ctx context.Context) error {
+	var nodeAddrs *nodeaddrs.Set
+	if r.NodeAddrs != nil {
+		nodeAddrs = r.NodeAddrs.Current()
+	}
 	res, err := ListResources(ctx, r.Client)
 	if err != nil {
 		return fmt.Errorf("provider: list resources: %w", err)
@@ -227,6 +304,7 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 	graph := BuildGraph(res, GraphOptions{
 		AllowNginxSnippets: r.AllowNginxSnippets,
 		AllowExtraFiles:    r.AllowExtraFiles,
+		NodeAddresses:      nodeAddrs,
 	})
 	// BuildGraph is pure: advisories (legacy annotation deprecations,
 	// flag-gated annotations ignored, skipped extra-file refs) surface as
@@ -234,6 +312,11 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 	for _, w := range graph.Warnings {
 		r.Log.Info(w)
 	}
+	// Silent-skip observability (DESIGN-multinode-addresses.md §0): every
+	// listener this node does not own produces a Gateway Event naming the
+	// node and the addresses it could not bind — the ownership model
+	// itself never writes status for another node's listeners.
+	r.reportSkippedListeners(graph)
 	cfg := graph.Configuration()
 	certs := graph.Certificates()
 
@@ -264,7 +347,13 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 		}
 	}
 	// Layer 2: Gateway + Listener conditions + status.addresses (§3.4).
+	// Multinode ownership MVP: a Gateway this node does not own (zero
+	// owned listeners) is left COMPLETELY untouched — the node holding
+	// its addresses reports it (DESIGN-multinode-addresses.md §3).
 	for _, gw := range graph.Gateways {
+		if !gw.OwnedHere() {
+			continue
+		}
 		addrs := gw.StatusAddresses(r.PublishAddresses, r.FallbackAddresses)
 		_, err := r.Writer.UpdateGatewayStatus(ctx, gw.Resource,
 			gw.Conditions(apply), gw.ListenerStatuses(apply), addrs)
@@ -287,6 +376,45 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// reportSkippedListeners emits one ListenerSkippedOnNode Event per Gateway
+// with listeners this node skipped (spec.addresses not present on this
+// node — they belong to another node's nginx), and feeds the /metrics
+// counter (DESIGN-multinode-addresses.md §0: "静默跳过的缓解：Kubernetes
+// Event（ListenerSkippedOnNode，含节点名/地址/指纹）"). Events are
+// observations, not status: they are emitted even for Gateways this node
+// does not own at all.
+func (r *Reconciler) reportSkippedListeners(graph *Graph) {
+	skipped := 0
+	for _, gw := range graph.Gateways {
+		for _, li := range gw.Listeners {
+			if li.Owned || !li.Valid {
+				continue // owned here, or a spec error already in status
+			}
+			skipped++
+			if r.Events != nil {
+				r.Events.Eventf(gw.Resource, corev1.EventTypeNormal, "ListenerSkippedOnNode",
+					"node %s does not own listener %q: addresses %v are not present on this node; another node serves it",
+					r.nodeName(), li.Spec.Name, li.SkippedAddresses)
+			}
+		}
+	}
+	if skipped > 0 && r.OnListenersSkipped != nil {
+		r.OnListenersSkipped(skipped)
+	}
+}
+
+// nodeName resolves this node's identity for events (empty → hostname).
+func (r *Reconciler) nodeName() string {
+	if r.NodeName != "" {
+		return r.NodeName
+	}
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return "<unknown>"
+	}
+	return h
 }
 
 // ListResources snapshots every watched type from the (cached) client.

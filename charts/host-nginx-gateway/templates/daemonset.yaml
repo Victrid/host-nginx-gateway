@@ -88,6 +88,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
+            # Downward API: the node's name — identifies this node in
+            # ListenerSkippedOnNode events (multinode ownership,
+            # DESIGN-multinode-addresses.md §0).
+            - name: HNG_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           {{- if .Values.probes.enabled }}
           # healthz binds 127.0.0.1 inside the pod — kubelet cannot
           # httpGet it, so use a local exec probe.

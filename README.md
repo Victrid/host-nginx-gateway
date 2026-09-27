@@ -77,7 +77,7 @@ server {
 | `listeners[].hostname` | ✅ | `server_name`, exact and wildcard per spec |
 | `listeners[].allowedRoutes` | ✅ | `Same` (default), `Selector`, `All`; `kinds` → `supportedKinds` status |
 | `listeners[].tls.certificateRefs` | ✅ | Same-namespace, or cross-namespace with ReferenceGrant |
-| `spec.addresses` | ❌ | The controller reports `status.addresses` itself (`--publish-addresses` / node IP) |
+| `spec.addresses` | ✅ | **Binding intent** (v0.3.0+): `type: IPAddress` entries become the `listen` addresses; each node of the DaemonSet renders only the addresses its fingerprint holds, so addresses partition Gateways across nodes. Only `IPAddress` is bindable — a `Hostname`-type entry makes the listener `Accepted=False` |
 
 ### Supported HTTPRoute fields
 
@@ -96,12 +96,13 @@ server {
 
 ### Annotations
 
-The controller's own annotations live in the `hng.victrid.dev/` namespace. Until v0.3.0 the legacy `gateway.host-nginx/<name>` spellings are still read when the new-style key is absent (a deprecation warning is logged each sync); the new-style value always wins on conflict.
+The controller's own annotations live in the `hng.victrid.dev/` namespace. Since v0.3.0 there are only the flag-gated escape-hatch annotations below — `listen-addresses` and `publish-addresses` were **removed** (see the migration note).
 
-| Annotation | Object | Purpose |
-|---|---|---|
-| `hng.victrid.dev/listen-addresses` | Gateway | Comma-separated bind addresses that replace the wildcard `listen` (e.g. `"192.168.1.10,[::]"`) |
-| `hng.victrid.dev/publish-addresses` | Gateway | Comma-separated IPs reported in `status.addresses` (overrides `--publish-addresses`) |
+> [!IMPORTANT]
+> **Breaking changes in v0.3.0** (multinode ownership model):
+> * `spec.addresses` is now **binding intent**: set `type: IPAddress` entries to pin a Gateway to specific node addresses. Each node renders only the intersection with its own address fingerprint (probed at startup and every 60 s, debounced); a Gateway whose addresses a node does not hold is skipped there entirely (no server block, no status write) — another node serves it. Gateways without `spec.addresses` keep the wildcard bind on every node, and the per-Gateway loopback auto-assignment for indistinct listeners is unchanged.
+> * The `hng.victrid.dev/listen-addresses` and `hng.victrid.dev/publish-addresses` annotations (and their legacy `gateway.host-nginx/` spellings) are **removed with no fallback**. Migrate binds to `spec.addresses` (`type: IPAddress`); `status.addresses` is now derived automatically from the listens each node actually renders (`--publish-addresses` remains as an external override, e.g. for a load balancer in front of the nodes).
+> * `Hostname`-type `spec.addresses` entries are not bindable: the listener reports `Accepted=False` per the Gateway API spec.
 
 ### Escape hatch: raw nginx snippets and extra files (danger flags)
 
@@ -130,6 +131,15 @@ k3s API ──watch──► Full Reconciler ──► graph (IR) ──► text
 ```
 
 The controller runs as a DaemonSet pod, watches Gateway resources through its in-cluster ServiceAccount, and renders the desired nginx configuration from an internal IR. Publishing validates against a temporary copy of your real `nginx.conf` (your config is never modified), replaces files atomically, signals the host nginx through the host mount namespace, and verifies new listen sockets actually came up — rolling back automatically on failure.
+
+### Multinode deployments (`spec.addresses`)
+
+In a DaemonSet over several nodes running host nginx, `spec.addresses` (`type: IPAddress`) partitions Gateways across nodes by address:
+
+* Each node's controller probes the node's addresses (startup + every 60 s, with a 2-probe debounce) and renders `listen` directives only for the addresses it actually holds — the rest of the cluster's Gateways are skipped on that node (no server block, no status write; a `ListenerSkippedOnNode` event and the `hng_listeners_skipped_total` metric make the skip observable).
+* A Gateway with no `spec.addresses` binds the wildcard on **every** node (all nodes serve it). The whole `127/8` loopback range is considered held by every node, which is what backs the automatic per-Gateway loopback assignment for indistinct listeners.
+* `status.addresses` is derived from the listens each node actually renders (plus `--publish-addresses` as an external override). A Gateway whose listeners' effective addresses land on different nodes is reported by each owning node for its own slice — listener status entries are only written by nodes that own the listener.
+* Helm/argocd-generated Gateways that need a fixed address should pin it via `spec.addresses` with the node's IP.
 
 ### Default servers and unknown hosts (FAQ)
 

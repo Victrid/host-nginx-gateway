@@ -16,12 +16,19 @@ import (
 
 // Metrics aggregates the counters exposed on /metrics. Safe for concurrent
 // use. The provider calls Applier.Apply exactly once per full sync, so
-// Reconciles doubles as the full-sync counter (DESIGN.md §7).
+// Reconciles doubles as the full-sync counter (DESIGN.md §7). SkippedListeners
+// counts listeners whose spec.addresses this node does not hold (multinode
+// ownership, DESIGN-multinode-addresses.md §0) — paired with the
+// ListenerSkippedOnNode Gateway Events.
 type Metrics struct {
-	Reconciles      atomic.Int64
-	ReloadSuccesses atomic.Int64
-	ReloadFailures  atomic.Int64
+	Reconciles       atomic.Int64
+	ReloadSuccesses  atomic.Int64
+	ReloadFailures   atomic.Int64
+	SkippedListeners atomic.Int64
 }
+
+// AddSkippedListeners bumps the skipped-listener counter (n per full sync).
+func (m *Metrics) AddSkippedListeners(n int) { m.SkippedListeners.Add(int64(n)) }
 
 // Handler returns the http.Handler serving /healthz and /metrics.
 func (m *Metrics) Handler() http.Handler {
@@ -58,4 +65,7 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"hng_dataplane_applies_total{result=\"success\"} %d\n"+
 		"hng_dataplane_applies_total{result=\"failure\"} %d\n",
 		m.ReloadSuccesses.Load(), m.ReloadFailures.Load())
+	_, _ = fmt.Fprintf(w, "# HELP hng_listeners_skipped_total Listeners skipped on this node because their spec.addresses are not present (multinode ownership; see ListenerSkippedOnNode events).\n"+
+		"# TYPE hng_listeners_skipped_total counter\n"+
+		"hng_listeners_skipped_total %d\n", m.SkippedListeners.Load())
 }

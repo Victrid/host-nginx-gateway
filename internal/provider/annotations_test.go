@@ -1,13 +1,11 @@
-// Annotation-namespace migration (v0.2.0) and danger-flag tests
-// (DESIGN-multinode-addresses.md §0 / §5):
-//   - own annotations moved to hng.victrid.dev/<name>; the legacy
-//     gateway.host-nginx/<name> spelling is still read when the new-style
-//     key is absent, recording a deprecation warning; new-style wins on
-//     conflict;
-//   - snippet / extra-file annotations are ignored with a recorded warning
-//     when their danger flag is off, honored when on;
-//   - extra-files resolution: same-namespace refs only, missing refs
-//     skipped, entries keyed files/<ns>_<name>/<key>.
+// Annotation handling tests (v0.3.0 state):
+//   - the danger-flag escape-hatch annotations (server-snippet /
+//     location-snippet / extra-files) are ignored with a recorded warning
+//     when their flag is off, honored when on;
+//   - they exist ONLY in the hng.victrid.dev/ namespace (legacy
+//     gateway.host-nginx/<name> spellings are unknown keys);
+//   - the listen-addresses / publish-addresses annotations were REMOVED
+//     (see TestRemovedAnnotations_HaveNoEffect in addresses_test.go).
 package provider
 
 import (
@@ -56,79 +54,6 @@ func addObjects(t *testing.T, res *Resources, objs ...any) {
 		default:
 			t.Fatalf("unsupported test object %T", o)
 		}
-	}
-}
-
-func TestAnnotationMigration_ListenAddresses(t *testing.T) {
-	mk := func(ann map[string]string) *gatewayv1.Gateway {
-		gw := testGateway("default", "gw", "c", 1, plainListener("web", 80, host("example.com")))
-		gw.Annotations = ann
-		return gw
-	}
-	cases := []struct {
-		name    string
-		ann     map[string]string
-		want    []string
-		wantDep bool
-	}{
-		{"new namespace", map[string]string{ListenAddressesAnnotation: "192.168.1.10"}, []string{"192.168.1.10"}, false},
-		{"legacy fallback", map[string]string{"gateway.host-nginx/listen-addresses": "192.168.1.10"}, []string{"192.168.1.10"}, true},
-		{"both: new wins", map[string]string{
-			ListenAddressesAnnotation:             "10.0.0.1",
-			"gateway.host-nginx/listen-addresses": "192.168.1.10",
-		}, []string{"10.0.0.1"}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := build(t, testClass("c", ControllerName, 1), mk(tc.ann))
-			li := listenerOf(t, gatewayOf(t, g, "default", "gw"), "web")
-			if len(li.Addresses) != len(tc.want) {
-				t.Fatalf("addresses = %v, want %v", li.Addresses, tc.want)
-			}
-			for i := range tc.want {
-				if li.Addresses[i] != tc.want[i] {
-					t.Fatalf("addresses = %v, want %v", li.Addresses, tc.want)
-				}
-			}
-			deps := warningsContaining(g, "listen-addresses")
-			if tc.wantDep && len(deps) != 1 {
-				t.Fatalf("deprecation warning missing: %v", g.Warnings)
-			}
-			if !tc.wantDep && len(deps) != 0 {
-				t.Fatalf("unexpected deprecation warning: %v", deps)
-			}
-		})
-	}
-}
-
-func TestAnnotationMigration_PublishAddresses(t *testing.T) {
-	gw := testGateway("default", "gw", "c", 1, plainListener("web", 80, host("example.com")))
-	gw.Annotations = map[string]string{"gateway.host-nginx/publish-addresses": "203.0.113.9"}
-	g := build(t, testClass("c", ControllerName, 1), gw)
-	info := gatewayOf(t, g, "default", "gw")
-	if info.PublishAddresses != "203.0.113.9" {
-		t.Fatalf("PublishAddresses = %q", info.PublishAddresses)
-	}
-	if len(warningsContaining(g, "publish-addresses is deprecated")) != 1 {
-		t.Fatalf("deprecation warning missing: %v", g.Warnings)
-	}
-	addrs := info.StatusAddresses(nil, nil)
-	if len(addrs) != 1 || addrs[0].Value != "203.0.113.9" {
-		t.Fatalf("status addresses = %+v", addrs)
-	}
-
-	// New-style wins over legacy on conflict.
-	gw2 := testGateway("default", "gw2", "c", 1, plainListener("web", 80, host("example.com")))
-	gw2.Annotations = map[string]string{
-		PublishAddressesAnnotation:             "198.51.100.1",
-		"gateway.host-nginx/publish-addresses": "203.0.113.9",
-	}
-	g2 := build(t, testClass("c", ControllerName, 1), gw2)
-	if got := gatewayOf(t, g2, "default", "gw2").PublishAddresses; got != "198.51.100.1" {
-		t.Fatalf("new-style must win, got %q", got)
-	}
-	if len(warningsContaining(g2, "publish-addresses is deprecated")) != 0 {
-		t.Fatalf("no deprecation warning expected when new-style present: %v", g2.Warnings)
 	}
 }
 

@@ -236,13 +236,11 @@ func TestConflicts_CrossGateway(t *testing.T) {
 	}
 }
 
-func TestConflicts_CrossGatewayAnnotatedCollision(t *testing.T) {
-	// Explicit (annotation) binds that collide cannot be separated by the
-	// controller — §3.2 marks both sides Conflicted (no winner).
-	gw1 := testGateway("default", "gw1", "c", 1, plainListener("web", 80, host("example.com")))
-	gw2 := testGateway("default", "gw2", "c", 1, plainListener("web", 80, host("example.com")))
-	gw1.Annotations = map[string]string{ListenAddressesAnnotation: "192.168.1.10"}
-	gw2.Annotations = map[string]string{ListenAddressesAnnotation: "192.168.1.10"}
+func TestConflicts_CrossGatewayPinnedCollision(t *testing.T) {
+	// Explicit (spec.addresses) binds that collide cannot be separated by
+	// the controller — §3.2 marks both sides Conflicted (no winner).
+	gw1 := addrGateway("default", "gw1", ipAddrs("192.168.1.10"))
+	gw2 := addrGateway("default", "gw2", ipAddrs("192.168.1.10"))
 	g := build(t, testClass("c", ControllerName, 1), gw1, gw2)
 	for _, gwName := range []string{"gw1", "gw2"} {
 		li := listenerOf(t, gatewayOf(t, g, "default", gwName), "web")
@@ -256,10 +254,8 @@ func TestConflicts_CrossGatewayAnnotatedCollision(t *testing.T) {
 }
 
 func TestConflicts_CrossGatewayDisjointAddresses(t *testing.T) {
-	gw1 := testGateway("default", "gw1", "c", 1, plainListener("web", 80, host("example.com")))
-	gw2 := testGateway("default", "gw2", "c", 1, plainListener("web", 80, host("example.com")))
-	gw1.Annotations = map[string]string{ListenAddressesAnnotation: "192.168.1.10"}
-	gw2.Annotations = map[string]string{ListenAddressesAnnotation: "10.0.0.1"}
+	gw1 := addrGateway("default", "gw1", ipAddrs("192.168.1.10"))
+	gw2 := addrGateway("default", "gw2", ipAddrs("10.0.0.1"))
 	g := build(t, testClass("c", ControllerName, 1), gw1, gw2)
 	for _, gwName := range []string{"gw1", "gw2"} {
 		if li := listenerOf(t, gatewayOf(t, g, "default", gwName), "web"); li.Conflicted {

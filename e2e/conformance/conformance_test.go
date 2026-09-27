@@ -12,11 +12,18 @@ Former adaptations, now PRODUCT features (round 5):
     cross-Gateway listeners would be indistinct (same port, overlapping
     hostnames) its own 127.0.0.N bind (Gateway API v1 "Distinct Listeners"
     over merged data planes) and reports that address in status.addresses.
+    Since v0.3.0 the multinode ownership model intersects spec.addresses
+    with the node's address fingerprint — the base Gateways set no
+    spec.addresses (wildcard intent) and the auto-assigned pool is inside
+    127/8, which every node owns implicitly, so this harness path is
+    unchanged (wildcard/loopback ownership preserved; see
+    TestNodeFilter_LoopbackAutoAssignPreserved).
 
   - ADDRESS SHIM → REMOVED: the controller writes status.addresses itself
-    (--publish-addresses / HNG_NODE_IP / auto-assigned loopback /
-    publish-addresses annotation), so the suite's address gate validates
-    real controller behavior.
+    (v0.3.0 derivation: --publish-addresses flag → the listens this node
+    renders for the Gateway → wildcard binds reported as the node primary
+    IP via HNG_NODE_IP), so the suite's address gate validates real
+    controller behavior.
 
   - HTTPS BASE GATEWAY DELETION → REMOVED: with per-Gateway loopback binds
     (auto-assignment) and reload-effect verification (error-log bind
@@ -102,7 +109,7 @@ func TestConformance(t *testing.T) {
 	tc.GatewayMustHaveAddress = 5 * time.Second // was 180s
 	// NamespacesMustBeReady includes Deployment rollout + image pulls:
 	// 30s keeps fail-fast pressure without flaking on cold pulls.
-	tc.NamespacesMustBeReady = 30 * time.Second // was 300s
+	tc.NamespacesMustBeReady = 30 * time.Second    // was 300s
 	tc.TLSRouteMustHaveCondition = 5 * time.Second // was 60s (profiles not run; compressed for completeness)
 	tc.TCPRouteMustHaveCondition = 5 * time.Second // was 60s
 	tc.UDPRouteMustHaveCondition = 5 * time.Second // was 60s

@@ -22,16 +22,16 @@ func serverByHostname(t *testing.T, cfg *contract.Configuration, hostname string
 
 // TestConfiguration_PerGroupCerts_TwoGateways reproduces the reported
 // defect: two Gateways in different namespaces with different TLS Secrets
-// sharing one socket (same explicit listen-addresses bind, same port,
+// sharing one socket (same explicit spec.addresses bind, same port,
 // disjoint hostnames — not a §3.2 conflict) must each render their OWN
 // certificate, not the first-processed listener's everywhere.
 func TestConfiguration_PerGroupCerts_TwoGateways(t *testing.T) {
 	argocd := testGateway("argocd", "main", "c", 1,
 		tlsListener("https", 443, host("argocd.example.com"), gatewayv1.HTTPSProtocolType, nil, "argocd-tls-secret"))
-	argocd.Annotations = map[string]string{ListenAddressesAnnotation: "100.64.0.5"}
+	argocd.Spec.Addresses = ipAddrs("100.64.0.5")
 	headlamp := testGateway("kube-system", "headlamp", "c", 1,
 		tlsListener("https", 443, host("headlamp.example.com"), gatewayv1.HTTPSProtocolType, nil, "headlamp-tls-secret"))
-	headlamp.Annotations = map[string]string{ListenAddressesAnnotation: "100.64.0.5"}
+	headlamp.Spec.Addresses = ipAddrs("100.64.0.5")
 	g := build(t,
 		testClass("c", ControllerName, 1),
 		testTLSSecret("argocd", "argocd-tls-secret"),

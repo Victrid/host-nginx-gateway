@@ -27,6 +27,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/Victrid/HostNginxGateway/internal/contract"
+	"github.com/Victrid/HostNginxGateway/internal/nodeaddrs"
 )
 
 const (
@@ -40,25 +41,11 @@ const (
 	// "全部自有注解统一为 hng.victrid.dev/<name>").
 	AnnotationPrefix = "hng.victrid.dev/"
 
-	// LegacyAnnotationPrefix is the pre-v0.2.0 annotation namespace. Read
-	// as a ONE-VERSION fallback (v0.2.0 only) when the new-style key is
-	// absent; usage logs a deprecation warning. Removed in v0.3.0.
-	LegacyAnnotationPrefix = "gateway.host-nginx/"
-
-	// ListenAddressesAnnotation carries a comma-separated list of extra bind
-	// addresses for every listener port of a Gateway (DESIGN.md §3.1):
-	//
-	//	hng.victrid.dev/listen-addresses: "192.168.1.10,[::]"
-	ListenAddressesAnnotation = AnnotationPrefix + "listen-addresses"
-
-	// PublishAddressesAnnotation overrides the addresses this controller
-	// reports in Gateway status.addresses (DESIGN.md §3.4). Comma-separated
-	// IP list; when absent the controller falls back to --publish-addresses,
-	// then to an auto-assigned loopback (cross-Gateway same-port separation),
-	// then to the detected node IP.
-	//
-	//	hng.victrid.dev/publish-addresses: "192.168.1.10"
-	PublishAddressesAnnotation = AnnotationPrefix + "publish-addresses"
+	// NOTE (v0.3.0): the pre-v0.2.0 `gateway.host-nginx/<name>` fallback
+	// and the listen-addresses / publish-addresses annotations were
+	// REMOVED. spec.addresses (IPAddress type) is the binding intent and
+	// status.addresses derives from the rendered listens; see README.md
+	// ("Breaking changes in v0.3.0").
 
 	// ServerSnippetAnnotation injects raw nginx configuration inside every
 	// server block rendered from the Gateway
@@ -115,28 +102,16 @@ type GraphOptions struct {
 	AllowNginxSnippets bool
 	// AllowExtraFiles enables the hng.victrid.dev/extra-files annotation.
 	AllowExtraFiles bool
-}
 
-// annotationValue reads one of the controller's own annotations, new
-// namespace first, with the one-version legacy fallback
-// (DESIGN-multinode-addresses.md §0: v0.2.0 keeps reading
-// gateway.host-nginx/<name> with a deprecation warning; v0.3.0 removes it).
-// newName is the full new-style key; the legacy key is derived by swapping
-// the prefix. An empty new-style value counts as absent (the fallback
-// fires). usedLegacy reports that the legacy spelling supplied the value,
-// so the caller records the deprecation warning.
-func annotationValue(annotations map[string]string, newName string) (value string, usedLegacy bool) {
-	if annotations == nil {
-		return "", false
-	}
-	if v, ok := annotations[newName]; ok && v != "" {
-		return v, false
-	}
-	legacy := LegacyAnnotationPrefix + strings.TrimPrefix(newName, AnnotationPrefix)
-	if v, ok := annotations[legacy]; ok && v != "" {
-		return v, true
-	}
-	return "", false
+	// NodeAddresses is THIS node's address fingerprint
+	// (DESIGN-multinode-addresses.md §2). It intersects every listener's
+	// spec.addresses bind intent: only the intersection is rendered and
+	// reported; a non-wildcard listener whose intersection is empty is
+	// not owned by this node (no server block, no listener status entry,
+	// and — when the Gateway owns nothing here — no Gateway status
+	// write). Nil means "no fingerprint" (single-node semantics: every
+	// address is owned).
+	NodeAddresses *nodeaddrs.Set
 }
 
 // StaticUpstreamName returns the marker upstream name for a static response
@@ -243,11 +218,6 @@ type GatewayInfo struct {
 	// part of that tuple). Empty when no assignment was needed.
 	AutoAddress string
 
-	// PublishAddresses is the resolved publish-addresses annotation value
-	// (new namespace, legacy fallback applied by BuildGraph). StatusAddresses
-	// reads this instead of the raw annotations.
-	PublishAddresses string
-
 	// RawServerSnippet is the Gateway's hng.victrid.dev/server-snippet
 	// value, populated only when --dangerously-allow-nginx-snippets is on
 	// (DESIGN-multinode-addresses.md §5); copied onto every listener in
@@ -310,8 +280,26 @@ type ListenerInfo struct {
 	// status.listeners[].supportedKinds; nil for non-route protocols).
 	SupportedKinds []gatewayv1.RouteGroupKind
 
-	// Addresses are the extra bind addresses from ListenAddressesAnnotation.
+	// Addresses are the listener's EFFECTIVE bind addresses in nginx
+	// listen form (v4 plain, v6 bracketed): the Gateway's spec.addresses
+	// (binding intent, DESIGN-multinode-addresses.md §2) intersected with
+	// this node's address fingerprint by applyNodeFilter. Empty means the
+	// wildcard `listen <port>` form. Not-owned listeners end up empty
+	// here — see Owned.
 	Addresses []string
+	// Owned reports whether THIS node is responsible for the listener
+	// (multinode ownership MVP, DESIGN-multinode-addresses.md §2/§3):
+	// always true for invalid listeners (spec errors are ours to report
+	// in status) and wildcard listeners (every node binds the wildcard);
+	// false exactly when a non-wildcard listener's spec.addresses have an
+	// empty intersection with the node fingerprint. Not-owned listeners
+	// render nothing, get no listener status entry, and stay out of
+	// conflict detection — another node owns them.
+	Owned bool
+	// SkippedAddresses records the pre-intersection bind intent of a
+	// not-owned listener (Owned=false), for the ListenerSkippedOnNode
+	// event message. Empty for owned listeners.
+	SkippedAddresses []string
 	// RawServerSnippet carries the Gateway's server-snippet annotation
 	// through to the rendered server blocks (see GatewayInfo.RawServerSnippet).
 	RawServerSnippet string
@@ -574,22 +562,13 @@ func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 	// exist in the namespace of the referenced object, ReferenceGrant spec).
 	grantsByNamespace := indexReferenceGrants(res.ReferenceGrants)
 
-	// 2b. Per-Gateway annotations: legacy-namespace fallback +
-	// deprecation warnings (v0.2.0 one-version compatibility,
-	// DESIGN-multinode-addresses.md §0) and the flag-gated escape-hatch
-	// annotations (§5). Recorded as graph warnings — BuildGraph stays
-	// pure; the reconciler logs them.
+	// 2b. Per-Gateway escape-hatch annotations (§5a danger flags),
+	// recorded as graph warnings — BuildGraph stays pure; the reconciler
+	// logs them. (The listen-addresses / publish-addresses annotations
+	// were REMOVED in v0.3.0: spec.addresses is the binding intent and
+	// status.addresses derives from the rendered listens.)
 	for _, gw := range g.Gateways {
 		nsName := gw.Resource.Namespace + "/" + gw.Resource.Name
-		var legacy bool
-		if gw.PublishAddresses, legacy = annotationValue(gw.Resource.Annotations, PublishAddressesAnnotation); legacy {
-			g.warn(fmt.Sprintf("Gateway %s: annotation %s%s is deprecated; use %s (support removed in v0.3.0)",
-				nsName, LegacyAnnotationPrefix, "publish-addresses", PublishAddressesAnnotation))
-		}
-		if _, legacy = annotationValue(gw.Resource.Annotations, ListenAddressesAnnotation); legacy {
-			g.warn(fmt.Sprintf("Gateway %s: annotation %s%s is deprecated; use %s (support removed in v0.3.0)",
-				nsName, LegacyAnnotationPrefix, "listen-addresses", ListenAddressesAnnotation))
-		}
 		if v := gw.Resource.Annotations[ServerSnippetAnnotation]; v != "" {
 			if opts.AllowNginxSnippets {
 				gw.RawServerSnippet = v
@@ -618,20 +597,32 @@ func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 		}
 	}
 
-	// 4. Cross-Gateway indistinct listeners: assign distinct per-Gateway
+	// 4. Node address filtering (DESIGN-multinode-addresses.md §2): each
+	// listener's spec.addresses bind intent is intersected with this
+	// node's fingerprint. Listeners with an empty intersection are not
+	// owned here (another node serves them) — they render nothing, get
+	// no status entry and stay out of the conflict machinery. A nil
+	// fingerprint (probe unavailable, tests, single-node dev) owns
+	// everything: the pre-v0.3.0 semantics.
+	applyNodeFilter(g, opts.NodeAddresses)
+
+	// 5. Cross-Gateway indistinct listeners: assign distinct per-Gateway
 	// loopback bind addresses so the combined listener set (the controller
 	// merges ALL Gateways into one nginx data plane) satisfies the Gateway
 	// API "Distinct Listeners" rule via the address component of the
 	// (address, port, hostname) tuple (DESIGN.md §3.2, §3.4).
 	assignCrossGatewayAddresses(g)
 
-	// 5. Conflict detection (§3.2) — valid listeners only. Same-Gateway
-	// indistinctness is always a spec conflict; cross-Gateway pairs that
-	// remain indistinct after address assignment (explicit overlapping
-	// listen-addresses annotations) are marked Conflicted on both sides.
+	// 6. Conflict detection (§3.2) — valid, owned listeners only, over
+	// the post-intersection effective bind sets (§4 of the multinode
+	// design: listeners on different nodes with disjoint effective
+	// addresses coexist legally). Same-Gateway indistinctness is always a
+	// spec conflict; cross-Gateway pairs that remain indistinct after
+	// address assignment (explicit overlapping spec.addresses) are marked
+	// Conflicted on both sides.
 	detectConflicts(g)
 
-	// 6. HTTPRoutes in deterministic order so per-listener attachment (and
+	// 7. HTTPRoutes in deterministic order so per-listener attachment (and
 	// the resulting location ordering) is stable.
 	routes := append([]*gatewayv1.HTTPRoute(nil), res.HTTPRoutes...)
 	sort.Slice(routes, func(i, j int) bool {
@@ -656,6 +647,45 @@ func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 		g.Routes = append(g.Routes, ri)
 	}
 	return g
+}
+
+// applyNodeFilter intersects every listener's spec.addresses bind intent
+// with the node's address fingerprint (DESIGN-multinode-addresses.md §2):
+//
+//   - intersection non-empty → the listener binds ONLY the intersection
+//     (li.Addresses becomes the effective, post-shard bind set);
+//   - wildcard (no spec.addresses) → owned everywhere, binds unchanged;
+//   - empty intersection → not owned by this node: no server block, no
+//     listener status entry, excluded from conflict detection (another
+//     node serves it). The original intent is kept in SkippedAddresses
+//     for the ListenerSkippedOnNode event.
+//
+// Invalid listeners stay owned regardless of addresses: their spec error
+// must surface in this node's status writes (and it is identical on every
+// node, so the writes converge). A nil fingerprint owns everything
+// (single-node semantics).
+func applyNodeFilter(g *Graph, owned *nodeaddrs.Set) {
+	if owned == nil {
+		return
+	}
+	for _, gw := range g.Gateways {
+		for _, li := range gw.Listeners {
+			if !li.Valid || len(li.Addresses) == 0 {
+				continue // invalid = ours to report; wildcard = owned everywhere
+			}
+			var keep []string
+			for _, a := range li.Addresses {
+				if owned.Contains(a) {
+					keep = append(keep, a)
+				}
+			}
+			if len(keep) == 0 {
+				li.Owned = false
+				li.SkippedAddresses = append([]string(nil), li.Addresses...)
+			}
+			li.Addresses = keep
+		}
+	}
 }
 
 // assignCrossGatewayAddresses gives Gateways whose listeners are indistinct
@@ -707,8 +737,8 @@ func assignCrossGatewayAddresses(g *Graph) {
 	taken := map[string]struct{}{}
 	for _, gw := range g.Gateways {
 		for _, li := range gw.Listeners {
-			if !li.Valid {
-				continue
+			if !li.Valid || !li.Owned {
+				continue // not-owned listeners bind nothing here
 			}
 			for addr := range bindSet(li) {
 				taken[addr] = struct{}{}
@@ -717,12 +747,12 @@ func assignCrossGatewayAddresses(g *Graph) {
 	}
 
 	for _, gw := range ordered {
-		// Explicit per-listener binds (listen-addresses annotation) win; a
-		// Gateway keeps them and only wildcard-bound Gateways are moved.
+		// Explicit per-listener binds (spec.addresses) win; a Gateway
+		// keeps them and only wildcard-bound Gateways are moved.
 		annotated := false
 		wildcardListener := false
 		for _, li := range gw.Listeners {
-			if !li.Valid {
+			if !li.Valid || !li.Owned {
 				continue
 			}
 			if len(li.Addresses) > 0 {
@@ -741,7 +771,7 @@ func assignCrossGatewayAddresses(g *Graph) {
 		taken[addr] = struct{}{}
 		gw.AutoAddress = addr
 		for _, li := range gw.Listeners {
-			if !li.Valid || len(li.Addresses) > 0 {
+			if !li.Valid || !li.Owned || len(li.Addresses) > 0 {
 				continue
 			}
 			li.Addresses = []string{addr}
@@ -749,17 +779,17 @@ func assignCrossGatewayAddresses(g *Graph) {
 	}
 }
 
-// gatewaysIndistinct reports whether any valid listener pair across the two
-// Gateways is indistinct: same port, equivalent hostnames (equal or both
-// empty), overlapping bind sets (i.e. they would fight over the same
-// socket).
+// gatewaysIndistinct reports whether any valid, owned listener pair across
+// the two Gateways is indistinct: same port, equivalent hostnames (equal
+// or both empty), overlapping effective bind sets (i.e. they would fight
+// over the same socket on THIS node).
 func gatewaysIndistinct(a, b *GatewayInfo) bool {
 	for _, la := range a.Listeners {
-		if !la.Valid {
+		if !la.Valid || !la.Owned {
 			continue
 		}
 		for _, lb := range b.Listeners {
-			if !lb.Valid {
+			if !lb.Valid || !lb.Owned {
 				continue
 			}
 			if la.Spec.Port != lb.Spec.Port {
@@ -890,7 +920,8 @@ func resolveListener(gw *gatewayv1.Gateway, index int, secrets map[string]*corev
 		Valid:        true,
 		ResolvedRefs: true,
 		RefsReason:   string(gatewayv1.ListenerReasonResolvedRefs),
-		Addresses:    listenAddresses(gw),
+		Addresses:    gatewayBindAddresses(gw.Spec.Addresses),
+		Owned:        true,
 	}
 	invalid := func(reason, msg string) *ListenerInfo {
 		li.Valid, li.InvalidReason, li.InvalidMsg = false, reason, msg
@@ -902,6 +933,15 @@ func resolveListener(gw *gatewayv1.Gateway, index int, secrets map[string]*corev
 	if src.Port == 0 {
 		return invalid(string(gatewayv1.ListenerReasonInvalid),
 			"listener port is required (Gateway API v1, DESIGN.md S1)")
+	}
+
+	// spec.addresses is binding intent (DESIGN-multinode-addresses.md §2):
+	// only IPAddress values are bindable. Invalid or non-bindable entries
+	// MUST surface in the listener conditions (Gateway API spec: "invalid
+	// or unavailable addresses ... indicate ... in conditions") — never a
+	// silent ignore.
+	if msg := invalidGatewayAddresses(gw.Spec.Addresses); msg != "" {
+		return invalid(string(gatewayv1.ListenerReasonInvalid), msg)
 	}
 
 	switch src.Protocol {
@@ -1113,21 +1153,54 @@ func looksLikeKeyPEM(data []byte) bool {
 		bytes.Contains(data, []byte("PRIVATE KEY-----"))
 }
 
-// listenAddresses parses the listen-addresses annotation (§3.1), reading
-// the new hng.victrid.dev/ namespace with the one-version legacy fallback
-// (annotationValue; the deprecation warning is recorded by BuildGraph).
-func listenAddresses(gw *gatewayv1.Gateway) []string {
-	raw, _ := annotationValue(gw.Annotations, ListenAddressesAnnotation)
-	if raw == "" {
-		return nil
-	}
+// gatewayBindAddresses converts the Gateway's spec.addresses into bind
+// addresses in nginx listen form (v4 plain, v6 bracketed), deduplicated
+// in spec order. Entries that are not type IPAddress / not parseable IPs
+// are DROPPED here — the listener-level error is produced separately by
+// invalidGatewayAddresses so every listener of the Gateway carries the
+// same condition. A nil/empty result means the wildcard bind.
+func gatewayBindAddresses(specAddrs []gatewayv1.GatewaySpecAddress) []string {
 	var out []string
-	for _, part := range strings.Split(raw, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
+	seen := map[string]struct{}{}
+	for _, a := range specAddrs {
+		if t := deref(a.Type, gatewayv1.IPAddressType); t != gatewayv1.IPAddressType {
+			continue
 		}
+		form := nodeaddrs.RenderBindForm(a.Value)
+		if form == "" {
+			continue
+		}
+		if _, dup := seen[form]; dup {
+			continue
+		}
+		seen[form] = struct{}{}
+		out = append(out, form)
 	}
 	return out
+}
+
+// invalidGatewayAddresses returns the listener-invalidating message for
+// the Gateway's spec.addresses ("" when every entry is a bindable
+// IPAddress). Only IPAddress is bindable (DESIGN-multinode-addresses.md
+// §5: "仅 IPAddress 类型可作绑定意图；Hostname 类型不可绑定，按 GWA Spec
+// 要求在 GatewayStatus.Conditions 中报告无效").
+func invalidGatewayAddresses(specAddrs []gatewayv1.GatewaySpecAddress) string {
+	for i := range specAddrs {
+		a := &specAddrs[i]
+		t := gatewayv1.IPAddressType
+		if a.Type != nil {
+			t = *a.Type
+		}
+		if t != gatewayv1.IPAddressType {
+			return fmt.Sprintf(
+				"spec.addresses[%d] (%s) has type %q; only IPAddress is bindable — set spec.addresses entries to type IPAddress to pin this Gateway to node addresses",
+				i, a.Value, t)
+		}
+		if nodeaddrs.RenderBindForm(a.Value) == "" {
+			return fmt.Sprintf("spec.addresses[%d] value %q is not a valid IP address", i, a.Value)
+		}
+	}
+	return ""
 }
 
 // resolveExtraFiles resolves the hng.victrid.dev/extra-files annotation
@@ -1242,13 +1315,18 @@ func resolveExtraFiles(gw *GatewayInfo, raw string,
 
 // detectConflicts marks BOTH listeners of every conflicting pair; no
 // deterministic winner is chosen (B2: no name-based tie-breaking, avoid
-// silently overriding user intent).
+// silently overriding user intent). Only valid, OWNED listeners
+// participate: not-owned listeners bind nothing on this node, so their
+// would-be conflicts belong to the node that owns them.
 func detectConflicts(g *Graph) {
 	// Same Gateway: overlapping port+hostname (DESIGN.md §3.2).
 	for _, gw := range g.Gateways {
 		ls := gw.Listeners
 		for i := 0; i < len(ls); i++ {
 			for j := i + 1; j < len(ls); j++ {
+				if !ls[i].Owned || !ls[j].Owned {
+					continue
+				}
 				markConflict(ls[i], ls[j], sameGateway)
 			}
 		}
@@ -1260,6 +1338,9 @@ func detectConflicts(g *Graph) {
 		for j := i + 1; j < len(g.Gateways); j++ {
 			for _, la := range g.Gateways[i].Listeners {
 				for _, lb := range g.Gateways[j].Listeners {
+					if !la.Owned || !lb.Owned {
+						continue
+					}
 					markConflict(la, lb, crossGateway)
 				}
 			}
@@ -1275,7 +1356,7 @@ const (
 )
 
 func markConflict(a, b *ListenerInfo, scope conflictScope) {
-	if !a.Valid || !b.Valid || a.Conflicted || b.Conflicted {
+	if !a.Valid || !b.Valid || !a.Owned || !b.Owned || a.Conflicted || b.Conflicted {
 		return
 	}
 	if a.Spec.Port != b.Spec.Port {
@@ -1314,12 +1395,14 @@ func bindAddressesOverlap(a, b *ListenerInfo) bool {
 	return false
 }
 
-// bindSet normalises the listener's bind addresses; "" is the wildcard.
-// A listener without the listen-addresses annotation binds all addresses
-// (bare `listen <port>`). With the annotation, ONLY the annotated addresses
-// are bound — this is what makes the cross-Gateway "address:port" conflict
-// rule (§3.2) meaningful: two Gateways with disjoint bind addresses may
-// share a port.
+// bindSet normalises the listener's EFFECTIVE bind addresses; "" is the
+// wildcard. A listener without spec.addresses binds all addresses (the
+// bare `listen <port>` line — the auto-assignment path writes its
+// loopback into Addresses the same way). With spec.addresses, ONLY those
+// addresses (post node-fingerprint intersection) are bound — this is
+// what makes the cross-Gateway "address:port" conflict rule (§3.2) and
+// the multinode disjoint-address coexistence meaningful: two listeners
+// with disjoint bind sets may share a port.
 func bindSet(l *ListenerInfo) map[string]struct{} {
 	out := map[string]struct{}{}
 	add := func(addr string) {

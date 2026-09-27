@@ -56,20 +56,19 @@ func TestConfiguration_ProtocolListenMapping(t *testing.T) {
 	}
 }
 
-func TestConfiguration_ListenAddressesAnnotation(t *testing.T) {
-	gw := testGateway("default", "gw", "c", 1, plainListener("web", 8080, nil))
-	gw.Annotations = map[string]string{ListenAddressesAnnotation: "192.168.1.10,[::] , "}
+func TestConfiguration_SpecAddresses(t *testing.T) {
+	gw := addrGateway("default", "gw", ipAddrs("192.168.1.10", "fd00::1"))
 	g := build(t, testClass("c", ControllerName, 1), gw)
 	cfg := g.Configuration()
 	if len(cfg.Servers) != 1 {
 		t.Fatalf("servers: %+v", cfg.Servers)
 	}
 	want := []contract.Listen{
-		{Port: 8080, Address: "192.168.1.10"},
-		{Port: 8080, Address: "[::]"},
+		{Port: 80, Address: "192.168.1.10"},
+		{Port: 80, Address: "[fd00::1]"},
 	}
 	if !reflect.DeepEqual(cfg.Servers[0].Listens, want) {
-		t.Fatalf("listens = %+v, want %+v (annotation replaces the wildcard)", cfg.Servers[0].Listens, want)
+		t.Fatalf("listens = %+v, want %+v (spec.addresses replace the wildcard; v6 bracketed)", cfg.Servers[0].Listens, want)
 	}
 }
 

@@ -44,9 +44,10 @@ rewrites files under the host's `/etc/nginx/conf.d/k8s-gw`.
 * The controller binds **no ports** — the HOST nginx (outside Kubernetes)
   does all listening; no conflicts with in-cluster service load balancers.
 * Gateways should use ports not already bound by the host's own servers;
-  use the `hng.victrid.dev/listen-addresses` annotation to bind
-  specific addresses (the legacy `gateway.host-nginx/listen-addresses`
-  spelling is still read with a deprecation warning until v0.3.0).
+  pin a Gateway to specific node addresses with `spec.addresses`
+  (`type: IPAddress`, v0.3.0+): the node whose fingerprint holds the
+  address renders the `listen` directive, every other node skips the
+  Gateway (see the multinode ownership notes in the main README).
 * **WARNING — run at most ONE controller instance per host.** Two
   instances (a second release of this chart, or a manually started
   binary) are both full writers of

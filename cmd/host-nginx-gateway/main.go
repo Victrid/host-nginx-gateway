@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/Victrid/HostNginxGateway/internal/dataplane"
+	"github.com/Victrid/HostNginxGateway/internal/nodeaddrs"
 	"github.com/Victrid/HostNginxGateway/internal/provider"
 )
 
@@ -58,6 +59,16 @@ type config struct {
 }
 
 func main() {
+	// Hidden probe path (internal/nodeaddrs): re-executed by the prober
+	// through `nsenter -t 1 -n -- <self>` to enumerate the HOST network
+	// namespace's addresses (the pod's own interfaces are the pod
+	// network, not the node's). Handled before flag parsing; prints one
+	// address per line and exits.
+	if len(os.Args) > 1 && os.Args[1] == nodeaddrs.PrintAddressesFlag {
+		printNodeAddresses()
+		return
+	}
+
 	var cfg config
 	// Private FlagSet (not flag.CommandLine): importing controller-runtime
 	// (via internal/provider) pulls in pkg/client/config whose init()
@@ -80,12 +91,12 @@ func main() {
 			"Must not overlap any Gateway listener port.")
 	fs.StringVar(&cfg.publishAddresses, "publish-addresses", "",
 		"Comma-separated IPs to report in Gateway status.addresses "+
-			"(DESIGN.md §3.4). Default: detect the node's primary IP "+
-			"(HNG_NODE_IP env in the DaemonSet form, else the interface "+
-			"route default). A Gateway's hng.victrid.dev/publish-addresses "+
-			"annotation overrides this per Gateway (the legacy "+
-			"gateway.host-nginx/publish-addresses spelling is still read "+
-			"with a deprecation warning and removed in v0.3.0).")
+			"(external override — e.g. a load balancer or NAT in front of "+
+			"the nodes). Default: each Gateway reports the addresses its "+
+			"listeners actually bind on this node (spec.addresses / "+
+			"auto-assigned loopback), with wildcard binds reported as the "+
+			"node's primary IP (HNG_NODE_IP env in the DaemonSet form, "+
+			"else the interface route default).")
 	fs.StringVar(&cfg.nginxErrorLog, "nginx-error-log", "",
 		"Path to the error log used for reload-effect verification and "+
 			"emitted as the http-context error_log directive. Defaults to "+
@@ -223,7 +234,27 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		ErrorLogPath: effectiveErrorLog(cfg),
 	}
 
-	// 3. Provider manager (watches, full reconcile, status write-back).
+	// 3. Node address fingerprint (DESIGN-multinode-addresses.md §2): the
+	// multinode ownership model needs the NODE's addresses, which inside
+	// the pod only exist in the host network namespace — hence the
+	// nsenter'd self re-exec (internal/nodeaddrs). The initial probe is
+	// synchronous so the first full sync already filters with the real
+	// fingerprint; on failure the controller runs degraded (no
+	// fingerprint = own everything, the pre-v0.3.0 semantics) and keeps
+	// retrying every 60s with a 2-probe debounce.
+	self, selfErr := os.Executable()
+	if selfErr != nil {
+		return fmt.Errorf("resolving own executable path: %w", selfErr)
+	}
+	nodeProber := nodeaddrs.NewProber(
+		nodeaddrs.CommandProbe(1, self),
+		nodeaddrs.DefaultProbeInterval, nodeaddrs.DefaultDebounce,
+		logger.WithName("nodeaddrs"))
+	if err := nodeProber.Refresh(ctx); err != nil {
+		logger.Error(err, "initial node address probe failed — running without a fingerprint (single-node semantics); retrying periodically")
+	}
+
+	// 4. Provider manager (watches, full reconcile, status write-back).
 	// Connects with the in-cluster ServiceAccount (no kubeconfig flag —
 	// the DaemonSet pod's projected token is the only credential).
 	// Blocks until ctx is done. Our own healthz/metrics listener replaces
@@ -234,6 +265,9 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		FallbackAddresses:      detectPublishAddresses(),
 		AllowNginxSnippets:     cfg.allowNginxSnippets,
 		AllowExtraFiles:        cfg.allowExtraFiles,
+		NodeAddrs:              nodeProber,
+		NodeName:               nodeName(),
+		OnListenersSkipped:     metrics.AddSkippedListeners,
 		MetricsBindAddress:     "0",
 		HealthProbeBindAddress: "0",
 		Log:                    logger.WithName("provider"),
@@ -264,6 +298,37 @@ func effectiveErrorLog(cfg config) string {
 		return cfg.nginxErrorLog
 	}
 	return filepath.Join(cfg.nginxConfDir, "error.log")
+}
+
+// nodeName resolves this node's identity for ListenerSkippedOnNode events:
+// HNG_NODE_NAME (chart downward API, spec.nodeName), else the hostname.
+func nodeName() string {
+	if v := os.Getenv("HNG_NODE_NAME"); v != "" {
+		return v
+	}
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return "<unknown>"
+	}
+	return h
+}
+
+// printNodeAddresses implements the hidden nodeaddrs probe flag: list the
+// global-unicast addresses of the CURRENT network namespace, one per line
+// (the prober runs it inside the host network namespace via nsenter).
+func printNodeAddresses() {
+	addrs, err := nodeaddrs.Enumerate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "host-nginx-gateway:", err)
+		os.Exit(1)
+	}
+	if len(addrs) == 0 {
+		fmt.Fprintln(os.Stderr, "host-nginx-gateway: no global-unicast addresses found")
+		os.Exit(1)
+	}
+	for _, a := range addrs {
+		fmt.Println(a)
+	}
 }
 
 func fatal(msg string) {
