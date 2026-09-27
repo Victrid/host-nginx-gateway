@@ -1,0 +1,115 @@
+{{/*
+host-nginx-gateway DaemonSet (DESIGN.md §8.1):
+  hostPID      — liveness probe reads the nginx pid and kill(pid,0)s a
+                 host PID;
+  hostPath     — /etc/nginx (RW: generated conf, certs, temp main config),
+                 /host/run (RO: host /run, for nginx.pid). NOT mounted at
+                 /run: a pod's /run belongs to the runtime (the projected
+                 ServiceAccount token mounts under /run/secrets/... and
+                 runc must create that mountpoint — impossible inside a
+                 read-only hostPath mounted at /run);
+  nsenter exec — every nginx -t / nginx -s reload runs in the HOST network
+                 + mount namespaces via `nsenter -t 1 -n -m` (the only exec
+                 path), so validation sees the host's real addresses and
+                 reload see exactly what the
+                 host nginx will load;
+  in-cluster   — ServiceAccount token only, no kubeconfig mount.
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "host-nginx-gateway.name" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "host-nginx-gateway.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "host-nginx-gateway.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "host-nginx-gateway.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: controller
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "host-nginx-gateway.serviceAccountName" . }}
+      hostPID: true
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            - --nginx-conf-dir={{ .Values.nginx.confDir }}/conf.d/k8s-gw
+            - --nginx-pid={{ .Values.nginx.pidPath }}
+            - --nginx-binary={{ .Values.nginx.binary }}
+            - --healthz-addr={{ .Values.healthzAddr }}
+            {{- range .Values.args }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            # Downward API: the NODE's primary IP. Inside a pod the
+            # interface route sees the pod network, so the controller cannot
+            # detect the host address to advertise in Gateway
+            # status.addresses (§3.4) without help.
+            - name: HNG_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          {{- if .Values.probes.enabled }}
+          # healthz binds 127.0.0.1 inside the pod — kubelet cannot
+          # httpGet it, so use a local exec probe.
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "-", "http://{{ .Values.healthzAddr }}/healthz"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: host-nginx-etc
+              mountPath: {{ .Values.nginx.confDir }}
+            - name: host-run
+              # /run is NOT used as the mount target: the runtime owns a
+              # pod's /run (projected SA token mountpoint must be creatable).
+              mountPath: /host/run
+              readOnly: true
+      volumes:
+        - name: host-nginx-etc
+          hostPath:
+            path: {{ .Values.nginx.confDir }}
+            type: DirectoryOrCreate
+        - name: host-run
+          hostPath:
+            path: /run
+            type: Directory

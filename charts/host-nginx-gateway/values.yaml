@@ -1,0 +1,84 @@
+# host-nginx-gateway — DaemonSet deployment form (DESIGN.md §8.1).
+#
+# The controller runs one pod per node (nodeSelector to pin it where the
+# host nginx lives), connects with its in-cluster ServiceAccount (no
+# kubeconfig mount), and drives the HOST nginx through
+# `nsenter -t 1 -n -m -- /usr/sbin/nginx ...`.
+#
+# WARNING: run at most ONE controller instance per host — multiple
+# instances (e.g. a second release of this chart, or a manually started
+# binary) would write and reload /etc/nginx/conf.d/k8s-gw/00-global.conf
+# against each other (double-writer).
+
+# -- Controller container image.
+image:
+  repository: ghcr.io/victrid/host-nginx-gateway
+  tag: "0.1.0"
+  # DaemonSet pods are pinned to specific nodes; avoid surprise upgrades.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Host nginx integration. confDir is the HOST nginx prefix (mount /etc/nginx);
+# the owned config dir is <confDir>/conf.d/k8s-gw (DESIGN.md §2, fixed).
+nginx:
+  confDir: /etc/nginx
+  # Host /run is mounted read-only at /host/run (see daemonset.yaml); the
+  # pid path is expressed in the POD's view of the filesystem.
+  pidPath: /host/run/nginx.pid
+  binary: /usr/sbin/nginx
+  # Every nginx invocation runs inside the host network + mount namespaces
+  # via `nsenter -t 1 -n -m` (the only exec path; see DESIGN.md §8.1).
+
+# -- GatewayClass the controller claims (DESIGN.md §3.3). Must match
+# provider.ControllerName unless you run a renamed build.
+gatewayClass:
+  create: true
+  name: host-nginx
+  controllerName: gateway.host-nginx/controller
+
+# -- Pod placement: pin to nodes that run the host nginx.
+nodeSelector: {}
+  # kubernetes.io/os: linux
+  # hng.example.com/host-nginx: "true"
+tolerations: []
+affinity: {}
+
+# -- healthz/metrics listener inside the pod. Keep it OFF the data-plane
+# port space (the flag default 127.0.0.1:9125 already is).
+healthzAddr: 127.0.0.1:9125
+probes:
+  enabled: true
+
+# -- Extra container args appended after the templated ones.
+args: []
+
+resources: {}
+  # limits:
+  #   cpu: 200m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
+
+# -- Pod security. Default privileged (simplest correct set for
+# nsenter -n -m + signaling the root nginx master). The narrower alternative
+# is keepCaps [SYS_ADMIN, SYS_PTRACE, KILL] with privileged: false —
+# see charts README "Security".
+podSecurityContext:
+  runAsUser: 0
+securityContext:
+  privileged: true
+  # capabilities (used when privileged: false):
+  # add: ["SYS_ADMIN", "SYS_PTRACE", "KILL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
