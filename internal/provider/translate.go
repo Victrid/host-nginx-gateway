@@ -399,6 +399,15 @@ func (g *Graph) Configuration() *contract.Configuration {
 				TLSCert:  sb.tlsByGroup[hostname],
 				Listens:  sb.listens,
 			}
+			// Raw server snippet (§5a escape hatch): every server block
+			// rendered from a Gateway carries that Gateway's snippet. The
+			// block's FIRST claiming listener (deterministic plan order:
+			// Gateway × listener) names the Gateway — hostname groups only
+			// ever merge listeners of one Gateway claim chain, and the
+			// claimant is stable across syncs.
+			if cl := sb.tlsClaimant[hostname]; cl != nil {
+				srv.RawServerSnippet = cl.RawServerSnippet
+			}
 			srv.Locations = buildLocations(entries, dispatcher)
 			// Mirror subrequests resolve within their own server block, so
 			// every server whose locations mirror to a target carries its
@@ -431,6 +440,21 @@ func (g *Graph) Configuration() *contract.Configuration {
 	sort.Slice(cfg.Upstreams, func(a, b int) bool { return cfg.Upstreams[a].Name < cfg.Upstreams[b].Name })
 	sort.Slice(cfg.Maps, func(a, b int) bool { return cfg.Maps[a].Name < cfg.Maps[b].Name })
 	sort.Slice(cfg.SplitClients, func(a, b int) bool { return cfg.SplitClients[a].Name < cfg.SplitClients[b].Name })
+
+	// Extra files (§5a escape hatch): union of every Gateway's resolved
+	// entries, deduplicated by path, deterministic order (sorted by path).
+	seenFiles := map[string]*contract.ExtraFile{}
+	for _, gw := range g.Gateways {
+		for _, ef := range gw.ExtraFiles {
+			if _, dup := seenFiles[ef.RelPath]; !dup {
+				seenFiles[ef.RelPath] = &contract.ExtraFile{Path: ef.RelPath, Content: ef.Content}
+			}
+		}
+	}
+	for _, ef := range seenFiles {
+		cfg.ExtraFiles = append(cfg.ExtraFiles, ef)
+	}
+	sort.Slice(cfg.ExtraFiles, func(a, b int) bool { return cfg.ExtraFiles[a].Path < cfg.ExtraFiles[b].Path })
 	return cfg
 }
 
@@ -880,6 +904,13 @@ func buildLocations(entries []*entry, d *dispatchBuilder) []*contract.Location {
 		bySpecificity(foreign)
 		viable := append(own, foreign...)
 		if loc := d.locationFor(p, viable); loc != nil {
+			// Route-level snippet (§5a escape hatch): each location belongs
+			// to one route rule — the highest-precedence OWN entry's rule
+			// (own is specificity- then seq-ordered, both deterministic).
+			// Foreign fall-through cases never contribute their snippets.
+			if len(own) > 0 {
+				loc.RawSnippet = own[0].rule.RawSnippet
+			}
 			out = append(out, loc)
 		}
 	}
@@ -1037,7 +1068,8 @@ func (gw *GatewayInfo) rejection() (reason, msg string, rejected bool) {
 // "the network addresses that have been assigned to the Gateway", DESIGN.md
 // §3.4). Precedence:
 //
-//  1. the Gateway's gateway.host-nginx/publish-addresses annotation;
+//  1. the Gateway's hng.victrid.dev/publish-addresses annotation
+//     (resolved by BuildGraph with the legacy-namespace fallback);
 //  2. the operator's explicit --publish-addresses list;
 //  3. the auto-assigned loopback bind (cross-Gateway listener separation);
 //  4. the caller-provided default (flag default: the node's primary IP).
@@ -1045,7 +1077,7 @@ func (gw *GatewayInfo) rejection() (reason, msg string, rejected bool) {
 // An empty result means "nothing authoritative known" — the status writer
 // leaves any existing addresses untouched.
 func (gw *GatewayInfo) StatusAddresses(explicit, fallback []string) []gatewayv1.GatewayStatusAddress {
-	addrs := publishList(gw.Resource.Annotations[PublishAddressesAnnotation])
+	addrs := publishList(gw.PublishAddresses)
 	if len(addrs) == 0 {
 		addrs = explicit
 	}

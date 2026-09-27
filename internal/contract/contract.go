@@ -44,6 +44,32 @@ type Configuration struct {
 	// emitted once per upstream regardless of how many Servers reference
 	// them.
 	Upstreams []*Upstream `json:"upstreams,omitempty"`
+
+	// ExtraFiles are auxiliary files materialised by the applier under the
+	// owned conf dir before the configuration is published
+	// (DESIGN-multinode-addresses.md §5: --dangerously-allow-extra-files
+	// escape hatch). Path is RELATIVE to the owned conf dir and always
+	// starts with "files/" ("files/<ns>_<name>/<key>"); the applier
+	// rewrites snippet "@<key>@" placeholders into the absolute
+	// materialised path. Entries are deduplicated by Path and sorted by
+	// the producer (determinism, DESIGN.md S6).
+	ExtraFiles []*ExtraFile `json:"extraFiles,omitempty"`
+}
+
+// ExtraFile is one auxiliary file to materialise inside the owned conf dir
+// (Configuration.ExtraFiles). The provider derives Path from the ref's
+// namespace/name and the data key; the applier owns the on-disk layout and
+// the atomic write + orphan cleanup (same lifecycle as certificates,
+// DESIGN.md §5.3).
+type ExtraFile struct {
+	// Path is the materialised path relative to the owned conf dir
+	// ("files/<ns>_<name>/<key>"). The basename is the data key — the
+	// "@<key>@" placeholder in snippets resolves against it.
+	Path string `json:"path"`
+
+	// Content is the raw file body (ConfigMap data/binaryData value or
+	// Secret data value).
+	Content []byte `json:"content,omitempty"`
 }
 
 // String returns a stable, human-readable summary of the configuration
@@ -72,6 +98,15 @@ type Server struct {
 	// Locations are the location blocks for this server, sorted by Path by
 	// the producer.
 	Locations []*Location `json:"locations,omitempty"`
+
+	// RawServerSnippet is raw nginx configuration injected VERBATIM into
+	// this server block (DESIGN-multinode-addresses.md §5:
+	// hng.victrid.dev/server-snippet on the Gateway metadata, honored only
+	// with --dangerously-allow-nginx-snippets). The renderer places it
+	// after the server_name/ssl directives and before the location
+	// blocks. The producer has already substituted "@<key>@" extra-file
+	// placeholders with absolute paths by render time. Empty omits it.
+	RawServerSnippet string `json:"rawServerSnippet,omitempty"`
 }
 
 func (s *Server) String() string {
@@ -190,6 +225,13 @@ type Location struct {
 	// location. Nil means "render with nginx defaults"; non-nil with empty
 	// fields renders nothing for that field.
 	Timeouts *Timeouts `json:"timeouts,omitempty"`
+
+	// RawSnippet is raw nginx configuration injected VERBATIM at the end
+	// of this location block (DESIGN-multinode-addresses.md §5:
+	// hng.victrid.dev/location-snippet on the HTTPRoute metadata, honored
+	// only with --dangerously-allow-nginx-snippets). Placeholders were
+	// substituted by the producer before render. Empty omits it.
+	RawSnippet string `json:"rawSnippet,omitempty"`
 }
 
 func (loc *Location) String() string {

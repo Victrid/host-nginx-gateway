@@ -5,10 +5,15 @@
 //  1. probe nginx (pid file + kill -0, DESIGN.md §6) — not running wraps
 //     errs.ErrNginxNotRunning so the provider maps Programmed=False (Pending);
 //  2. sync TLS certificates into <conf-dir>/certs/ (DESIGN.md §5.3);
+//     2b. materialise extra files into <conf-dir>/files/
+//     (DESIGN-multinode-addresses.md §5) and substitute snippet
+//     "@<key>@" placeholders — an unresolvable placeholder fails here,
+//     before anything is written (fail-fast);
 //  3. publish the SINGLE global contract.Configuration as
 //     <conf-dir>/00-global.conf via dataplane.Publisher (validate via the
 //     temporary-main-config `nginx -t` method, §5.1, then rollback-capable
-//     reload, §5.2);
+//     reload, §5.2); orphan cleanup (certs + files) runs only after a
+//     successful publish;
 //  4. classify every failure into the internal/errs taxonomy so the
 //     provider's errs.StatusReason mapping produces the §3.4 reasons.
 package main
@@ -18,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	logr "github.com/go-logr/logr"
@@ -46,12 +52,16 @@ const globalConfName = "00-global"
 // DataplaneApplier implements provider.Applier.
 type DataplaneApplier struct {
 	// ConfDir is the owned directory (--nginx-conf-dir); the single
-	// generated file and certs/ live under it.
+	// generated file, certs/ and files/ live under it.
 	ConfDir string
 	// Nginx probes/reloads the host nginx master.
 	Nginx dataplane.NginxClient
 	// Certs materialises the desired certificate set under ConfDir/certs.
 	Certs *dataplane.CertsManager
+	// Files materialises the extra-files escape-hatch set under
+	// ConfDir/files (DESIGN-multinode-addresses.md §5). Nil skips the
+	// step (tests without extra files).
+	Files *dataplane.FilesManager
 	// Publisher renders, validates (nginx -t) and reloads.
 	Publisher *dataplane.Publisher
 	// Metrics receives the apply counters (nil-safe).
@@ -101,8 +111,30 @@ func (a *DataplaneApplier) Apply(ctx context.Context, cfg *contract.Configuratio
 		return errs.Reload("syncing TLS certificates to "+a.Certs.CertsDir, err)
 	}
 
-	// 3. Publish the single global configuration.
-	published, err := a.Publisher.Publish(ctx, globalConfName, a.withCertPaths(cfg))
+	// 2b. Extra files (DESIGN-multinode-addresses.md §5): materialise the
+	// desired set BEFORE publishing — the rendered config references the
+	// files by absolute path, so a missing file would fail `nginx -t` and
+	// (worse) pass validation against a stale one. Orphan deletion runs
+	// after the publish succeeded (same ordering contract as certs).
+	var extraFiles []dataplane.File
+	if a.Files != nil {
+		extraFiles = make([]dataplane.File, 0, len(cfg.ExtraFiles))
+		for _, ef := range cfg.ExtraFiles {
+			extraFiles = append(extraFiles, dataplane.File{Path: ef.Path, Content: ef.Content})
+		}
+		if err := a.Files.Ensure(extraFiles); err != nil {
+			return errs.Reload("syncing extra files under "+filepath.Join(a.ConfDir, "files"), err)
+		}
+	}
+
+	// 3. Publish the single global configuration (cert paths absolutised,
+	// snippet placeholders substituted — a placeholder that resolves
+	// against no extra file fails HERE, before anything is written).
+	prepared, err := a.prepare(cfg)
+	if err != nil {
+		return err
+	}
+	published, err := a.Publisher.Publish(ctx, globalConfName, prepared)
 	if err != nil {
 		if a.Metrics != nil {
 			a.Metrics.ReloadFailures.Add(1)
@@ -115,6 +147,13 @@ func (a *DataplaneApplier) Apply(ctx context.Context, cfg *contract.Configuratio
 		a.Log.Error(err, "certificate orphan cleanup failed (will retry next sync)")
 	} else if len(orphans) > 0 {
 		a.Log.Info("removed orphan certificates", "orphans", orphans)
+	}
+	if a.Files != nil {
+		if orphans, err := a.Files.Cleanup(extraFiles); err != nil {
+			a.Log.Error(err, "extra-file orphan cleanup failed (will retry next sync)")
+		} else if len(orphans) > 0 {
+			a.Log.Info("removed orphan extra files", "orphans", orphans)
+		}
 	}
 	if a.Metrics != nil {
 		a.Metrics.ReloadSuccesses.Add(1)
@@ -156,6 +195,101 @@ func (a *DataplaneApplier) withCertPaths(cfg *contract.Configuration) *contract.
 		out.Servers = append(out.Servers, &cp)
 	}
 	return out
+}
+
+// prepare returns a clone of cfg ready for rendering: TLSCert fields point
+// at the materialised certificate files (withCertPaths) and every snippet
+// "@<key>@" placeholder is replaced with the absolute materialised path of
+// the matching extra file (<ConfDir>/<ExtraFiles.Path>).
+//
+// Placeholder semantics (DESIGN-multinode-addresses.md §5): keys resolve
+// against the union of the configuration's extra files by file BASENAME;
+// when the same key occurs in several refs, the lexicographically first
+// materialised path wins (ExtraFiles is sorted by path — deterministic).
+// A placeholder matching no extra file is a render-time error: the sync
+// FAILS FAST through the Programmed=False path and nothing is written.
+//
+// DESIGN CHOICE — substitution lives here (the apply lane), not in the
+// provider: only the applier knows --nginx-conf-dir, so only it can emit
+// the absolute path the way it already does for ssl_certificate. The
+// provider carries the raw snippet and the ordered ExtraFiles set instead.
+var snippetPlaceholder = regexp.MustCompile(`@([^@]+)@`)
+
+func (a *DataplaneApplier) prepare(cfg *contract.Configuration) (*contract.Configuration, error) {
+	out := a.withCertPaths(cfg)
+	if out == nil {
+		return nil, nil
+	}
+	keyPaths := make(map[string]string, len(cfg.ExtraFiles))
+	for _, ef := range cfg.ExtraFiles {
+		key := filepath.Base(ef.Path)
+		if _, dup := keyPaths[key]; !dup {
+			keyPaths[key] = filepath.Join(a.ConfDir, ef.Path)
+		}
+	}
+	if len(keyPaths) == 0 {
+		// No extra files: any placeholder in a snippet is an error, but
+		// only snippets can contain one — skip the cloning work when none.
+		hasSnippet := false
+		for _, s := range out.Servers {
+			if s.RawServerSnippet != "" {
+				hasSnippet = true
+				break
+			}
+			for _, l := range s.Locations {
+				if l.RawSnippet != "" {
+					hasSnippet = true
+					break
+				}
+			}
+		}
+		if !hasSnippet {
+			return out, nil
+		}
+	}
+	substitute := func(owner, raw string) (string, error) {
+		var missing string
+		replaced := snippetPlaceholder.ReplaceAllStringFunc(raw, func(m string) string {
+			if p, ok := keyPaths[m[1:len(m)-1]]; ok {
+				return p
+			}
+			if missing == "" {
+				missing = m[1 : len(m)-1]
+			}
+			return m
+		})
+		if missing != "" {
+			return "", errs.Reload(
+				fmt.Sprintf("resolving nginx snippet placeholders of %s: @%s@ matches no extra file (hng.victrid.dev/extra-files)", owner, missing),
+				fmt.Errorf("unknown placeholder @%s@", missing))
+		}
+		return replaced, nil
+	}
+	for _, s := range out.Servers {
+		if s.RawServerSnippet != "" {
+			replaced, err := substitute("server block "+s.Hostname, s.RawServerSnippet)
+			if err != nil {
+				return nil, err
+			}
+			s.RawServerSnippet = replaced
+		}
+		for i, loc := range s.Locations {
+			if loc.RawSnippet == "" {
+				continue
+			}
+			replaced, err := substitute("location "+loc.Path, loc.RawSnippet)
+			if err != nil {
+				return nil, err
+			}
+			// Locations are shared with the input configuration
+			// (withCertPaths only clones the server structs) — copy
+			// before mutating.
+			lc := *loc
+			lc.RawSnippet = replaced
+			s.Locations[i] = &lc
+		}
+	}
+	return out, nil
 }
 
 // errorLogPath is the owned error log for reload-effect verification

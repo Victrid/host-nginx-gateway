@@ -537,7 +537,7 @@ func TestBackendResolution_Endpoints(t *testing.T) {
 			[]gatewayv1.ParentReference{gwParent("gw")}, backendRule("svc", 8080))},
 		EndpointSlices: slices,
 	}
-	g := BuildGraph(res)
+	g := BuildGraph(res, GraphOptions{})
 	pi := parentOf(t, routeOf(t, g, "default", "r"), "gw")
 	if !pi.Accepted || !pi.ResolvedRefs {
 		t.Fatalf("route should resolve: %+v", pi)
