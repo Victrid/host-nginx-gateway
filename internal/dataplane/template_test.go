@@ -220,6 +220,14 @@ func TestRender_GoldenSimpleHTTPServer(t *testing.T) {
 	}
 	want := "# Managed by HostNginxGateway. Do not edit by hand -- next sync will overwrite.\n" +
 		"\n" +
+		"# WebSocket proxying: HTTP/1.1 with hop-by-hop Upgrade/Connection handling.\n" +
+		"# One map for the whole http context; every proxying location forwards the\n" +
+		"# Upgrade/Connection headers through it.\n" +
+		"map $http_upgrade $connection_upgrade {\n" +
+		"    default upgrade;\n" +
+		"    '' close;\n" +
+		"}\n" +
+		"\n" +
 		"upstream default_app {\n" +
 		"    zone default_app 64k;\n" +
 		"    server 10.0.0.1:80;\n" +
@@ -230,6 +238,9 @@ func TestRender_GoldenSimpleHTTPServer(t *testing.T) {
 		"    server_name app.example.com;\n" +
 		"    location / {\n" +
 		"        proxy_pass http://default_app;\n" +
+		"        proxy_http_version 1.1;\n" +
+		"        proxy_set_header Upgrade $http_upgrade;\n" +
+		"        proxy_set_header Connection $connection_upgrade;\n" +
 		"        proxy_set_header Host $http_host;\n" +
 		"    }\n" +
 		"}"

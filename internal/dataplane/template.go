@@ -176,6 +176,16 @@ func buildLocation(loc contract.Location) string {
 			"        if ("+loc.Upstream+" = \"\") { return 404; }")
 	}
 	lines = append(lines, "        "+buildProxyPassURI(loc.Upstream, loc.ProxyPassURI))
+	// WebSocket support: proxy over HTTP/1.1 and relay the hop-by-hop
+	// Upgrade/Connection headers through the http-context
+	// $connection_upgrade map (emitted once by the template). For plain
+	// requests $http_upgrade is empty, so the Upgrade header is suppressed
+	// and Connection collapses to "close" — nginx's default upstream
+	// behavior, unchanged.
+	lines = append(lines,
+		"        proxy_http_version 1.1;",
+		"        proxy_set_header Upgrade $http_upgrade;",
+		"        proxy_set_header Connection $connection_upgrade;")
 	// Preserve the client's Host header (Gateway API v1, HTTPRoute
 	// spec.hostnames: "MUST forward this header unmodified to the
 	// backend", absent applicable header-modification configuration).

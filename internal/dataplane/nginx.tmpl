@@ -2,6 +2,14 @@
 {{- if .ErrorLog }}
 error_log {{ .ErrorLog }};
 {{- end }}
+
+# WebSocket proxying: HTTP/1.1 with hop-by-hop Upgrade/Connection handling.
+# One map for the whole http context; every proxying location forwards the
+# Upgrade/Connection headers through it.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
 {{- range .Maps }}
 
 map {{ .Source }} ${{ .Name }} {
@@ -39,9 +47,15 @@ server {
 {{- if .TLSCert }}
     {{ buildTLS .TLSCert }}
 {{- end }}
+{{- if .RawServerSnippet }}
+{{ .RawServerSnippet }}
+{{- end }}
 {{- range .Locations }}
     location {{ .Path }} {
 {{ buildLocation . }}
+{{- if .RawSnippet }}
+{{ .RawSnippet }}
+{{- end }}
     }
 {{- end }}
 }
