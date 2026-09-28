@@ -68,6 +68,7 @@ rewrites files under the host's `/etc/nginx/conf.d/k8s-gw`.
 | `args` | `[]` | Extra controller args appended after the templated ones |
 | `dangerouslyAllowNginxSnippets` | `false` | Pass `--dangerously-allow-nginx-snippets`: honor `hng.victrid.dev/server-snippet` (Gateway) / `hng.victrid.dev/location-snippet` (HTTPRoute) raw nginx snippets. Annotation writers must be trusted at cluster-admin level |
 | `dangerouslyAllowExtraFiles` | `false` | Pass `--dangerously-allow-extra-files`: honor `hng.victrid.dev/extra-files` (Gateway) — same-namespace ConfigMap/Secret data keys materialised under `<nginx.confDir>/conf.d/k8s-gw/files/` |
+| `connectionSidecar` | `false` | Enable the cluster-proxy connection sidecar (see below): injects the `ghcr.io/victrid/hng-sidecar` container (same tag as `image.tag`), a RW `/run/hng-proxy` hostPath into BOTH containers, `--cluster-proxy-sockets=/run/hng-proxy` on the controller, and a projected ServiceAccount token mounted into the controller ONLY (the sidecar gets no token). Precondition: the host network namespace cannot reach ClusterIPs (check the controller's startup probe log). Rollback: set it back to `false` — the next sync returns to direct connections |
 | `healthzAddr` | `127.0.0.1:9125` | In-pod healthz/metrics listener (keep off data-plane ports) |
 | `probes.enabled` | `true` | exec-based liveness probe against healthz |
 | `podSecurityContext` / `securityContext` | uid 0 / privileged | See Security above |
@@ -83,3 +84,21 @@ helm upgrade --install hng charts/host-nginx-gateway \
   --set image.repository=localhost/hng/controller \
   --set image.tag=v1 --set image.pullPolicy=Never
 ```
+
+## Cluster-proxy connection sidecar (`connectionSidecar`)
+
+Enable when the HOST network namespace cannot reach Service ClusterIPs
+(e.g. eBPF CNIs / NetworkPolicies; k3s does NOT need this). The
+controller probes reachability at startup (dialing the apiserver Service
+from the host netns) and logs a warning with enablement guidance when
+the path is broken and the sidecar is off.
+
+With `connectionSidecar: true` backend upstreams become
+`server unix:/run/hng-proxy/<ns>_<svc>_<port>.sock;` lines; the
+controller writes `/run/hng-proxy/proxy.json` and the sidecar container
+(the same Go build as the controller, `cluster-proxy-sidecar`
+subcommand, `ghcr.io/victrid/hng-sidecar` with the same version tag)
+binds the sockets and pumps bytes to the ClusterIPs from the pod network
+namespace. Prerequisite and rollback: off = direct ClusterIP
+connections, exactly the pre-feature behavior. Full story in the main
+README ("ClusterIP reachability and the connection sidecar").

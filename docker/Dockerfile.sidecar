@@ -1,0 +1,30 @@
+# Cluster-proxy sidecar image (DESIGN-cluster-proxy.md §0.10).
+#
+# Same Go build target as Dockerfile.controller (the single binary hosts
+# both entrypoints); this variant only differs in the final ENTRYPOINT —
+# `cluster-proxy-sidecar` instead of the controller. Built from the SAME
+# multi-arch matrix and version tag as the controller image
+# (ghcr.io/victrid/hng-sidecar).
+#
+# The sidecar needs neither nsenter (it never execs into the host) nor
+# ca-certificates (it never talks TLS) — only the static binary.
+#
+# Build: docker build -f docker/Dockerfile.sidecar -t hng-sidecar:v0 .
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+# GOPROXY is overridable at build time (see Dockerfile.controller).
+ARG GOPROXY=
+ENV GOPROXY=${GOPROXY}
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/host-nginx-gateway ./cmd/host-nginx-gateway
+
+FROM alpine:3.22
+COPY --from=build /out/host-nginx-gateway /usr/local/bin/host-nginx-gateway
+# Runs as uid 0 like the controller (binds sockets on the shared hostPath).
+ENTRYPOINT ["/usr/local/bin/host-nginx-gateway", "cluster-proxy-sidecar"]

@@ -14,6 +14,14 @@ host-nginx-gateway DaemonSet (DESIGN.md §8.1):
                  reload see exactly what the
                  host nginx will load;
   in-cluster   — ServiceAccount token only, no kubeconfig mount.
+
+connectionSidecar=true adds (DESIGN-cluster-proxy.md):
+  * a /run/hng-proxy hostPath (DirectoryOrCreate) mounted RW into BOTH
+    containers — the controller writes proxy.json, the sidecar binds the
+    *.sock files nginx dials (independent of the RO /host/run mount);
+  * Pod-level automountServiceAccountToken: false with a projected token
+    volume mounted into the CONTROLLER container only; the sidecar holds
+    no Kubernetes credentials at all.
 */}}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -40,6 +48,11 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "host-nginx-gateway.serviceAccountName" . }}
+      {{- if .Values.connectionSidecar }}
+      # The sidecar must never see Kubernetes credentials: only the
+      # controller container mounts the projected token volume below.
+      automountServiceAccountToken: false
+      {{- end }}
       hostPID: true
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -75,6 +88,9 @@ spec:
             {{- end }}
             {{- if .Values.dangerouslyAllowExtraFiles }}
             - --dangerously-allow-extra-files
+            {{- end }}
+            {{- if .Values.connectionSidecar }}
+            - --cluster-proxy-sockets=/run/hng-proxy
             {{- end }}
             {{- range .Values.args }}
             - {{ . | quote }}
@@ -117,6 +133,45 @@ spec:
               # pod's /run (projected SA token mountpoint must be creatable).
               mountPath: /host/run
               readOnly: true
+            {{- if .Values.connectionSidecar }}
+            # Shared cluster-proxy sockets dir (RW: the controller writes
+            # proxy.json here; nginx connects to the sidecar's *.sock).
+            - name: cluster-proxy-sockets
+              mountPath: /run/hng-proxy
+            # Projected ServiceAccount token (the pod-level automount is
+            # off so the sidecar container gets no credentials). Mounted
+            # at the standard path controller-runtime's in-cluster config
+            # reads, with the usual ca.crt + namespace companions.
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
+        {{- if .Values.connectionSidecar }}
+        - name: cluster-proxy-sidecar
+          # Same Go build target as the controller, different ENTRYPOINT
+          # (DESIGN-cluster-proxy.md §0.10); released with the same tag.
+          image: "ghcr.io/victrid/hng-sidecar:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            - --sockets-dir=/run/hng-proxy
+            - --healthz-addr=127.0.0.1:9126
+          # Readiness = mapping loaded && socket count == mapping entry
+          # count (DESIGN-cluster-proxy.md §0.9). Deliberately NOT a dial
+          # check: backend health is not the sidecar's readiness.
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "-", "http://127.0.0.1:9126/healthz"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: cluster-proxy-sockets
+              mountPath: /run/hng-proxy
+        {{- end }}
       volumes:
         - name: host-nginx-etc
           hostPath:
@@ -126,3 +181,28 @@ spec:
           hostPath:
             path: /run
             type: Directory
+        {{- if .Values.connectionSidecar }}
+        # Cluster-proxy socket dir: host /run/hng-proxy (tmpfs — cleared
+        # on reboot; both sides self-heal from an empty dir).
+        - name: cluster-proxy-sockets
+          hostPath:
+            path: /run/hng-proxy
+            type: DirectoryOrCreate
+        # Projected ServiceAccount credentials for the CONTROLLER only.
+        - name: sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- end }}

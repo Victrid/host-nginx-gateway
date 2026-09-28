@@ -141,6 +141,30 @@ In a DaemonSet over several nodes running host nginx, `spec.addresses` (`type: I
 * `status.addresses` is derived from the listens each node actually renders (plus `--publish-addresses` as an external override). A Gateway whose listeners' effective addresses land on different nodes is reported by each owning node for its own slice — listener status entries are only written by nodes that own the listener.
 * Helm/argocd-generated Gateways that need a fixed address should pin it via `spec.addresses` with the node's IP.
 
+### ClusterIP reachability and the connection sidecar
+
+Kubernetes does **not** guarantee that a *host* network namespace can reach Service ClusterIPs — k3s happens to allow it, but eBPF CNIs, certain NetworkPolicies or custom routing can break the path. Host-nginx-gateway dials backends from the host (that is the whole point of using the host nginx), so on such clusters every request would 502 even though all Gateway statuses look healthy.
+
+The controller probes this once at startup: it dials the apiserver Service address (`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT` — a ClusterIP-backed address every cluster has) *from the host network namespace* via `nsenter -t 1 -n`. Unreachable + sidecar mode off → a warning log pointing at this section. The probe never changes behavior by itself.
+
+**When to use**: Gateways report `Programmed=True` but backend requests fail with 502/timeouts, and `curl <clusterIP>:<port>` from the host does not work.
+
+**Chart flag**: `connectionSidecar: true` (default `false`).
+
+**How it works** (3 lines):
+
+1. Backend resolution emits Service **ClusterIP** + backendRef port instead of EndpointSlice pod IPs, rendered as `server unix:/run/hng-proxy/<ns>_<svc>_<port>.sock;` upstream lines (weight/down semantics unchanged).
+2. The controller writes the socket→ClusterIP mapping to `/run/hng-proxy/proxy.json` (atomic write, deterministic order); nginx forwards semantics are 100% unchanged — all L7 behavior (Host rewrites, snippets, filters) stays in nginx.
+3. An injected sidecar container (`ghcr.io/victrid/hng-sidecar`, same version tag as the controller, no ServiceAccount token at all) watches that file, binds one unix socket per entry and pumps bytes L4-transparently to the ClusterIP *from the pod network namespace*, where reachability is guaranteed.
+
+The single Helm value keeps both containers in sync (sidecar + `--cluster-proxy-sockets=/run/hng-proxy` on the controller + a new RW `/run/hng-proxy` hostPath mounted into both). Turn it off and the next sync returns to direct connections.
+
+**Caveats**:
+
+* **Sidecar down = 502.** The controller does not track the sidecar's liveness; a dead sidecar is indistinguishable from dead backends (nginx retries/fails over per its normal upstream semantics). The sidecar's readiness probe (`/healthz`: mapping loaded and socket count == mapping count — deliberately *not* a dial check) keeps it out of endpoints until it serves.
+* **`/run` tmpfs is cleared on reboot — self-healing by design.** Both sides assume the directory may be empty: the sidecar unlinks stale `*.sock` files at startup and rebinds from `proxy.json`; the controller rewrites `proxy.json` on its first sync. No state survives, none is needed.
+* Sockets only exist per distinct `service:port` backend; idle connections are reaped after 15 min to prevent deadlocks; half-close (FIN) is propagated in both directions so keep-alive/websocket shutdown behaves like a direct connection.
+
 ### Default servers and unknown hosts (FAQ)
 
 **The controller never injects a default server.** Your nginx.conf owns the default server for every port nginx listens on. Every server block the controller emits is backed by a real route claim (Gateway listeners/routes); when no route claims a catch-all (hostname-less) position, the controller emits no block for it at all.

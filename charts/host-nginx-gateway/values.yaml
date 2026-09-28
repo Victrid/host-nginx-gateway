@@ -62,6 +62,20 @@ probes:
 dangerouslyAllowNginxSnippets: false
 dangerouslyAllowExtraFiles: false
 
+# -- Cluster-proxy connection sidecar (DESIGN-cluster-proxy.md). Enable
+# when the HOST network namespace cannot reach Service ClusterIPs
+# (e.g. eBPF CNIs / NetworkPolicies; k3s does NOT need this). When true:
+#   * a second container (ghcr.io/victrid/hng-sidecar, same tag as the
+#     controller image) runs the cluster-proxy-sidecar subcommand;
+#   * a new hostPath volume /run/hng-proxy is mounted RW into BOTH
+#     containers (not the RO /host/run);
+#   * the controller gets --cluster-proxy-sockets=/run/hng-proxy and
+#     renders backend upstreams as unix sockets instead of pod IPs;
+#   * the pod disables SA token automount; a projected token is mounted
+#     into the controller container ONLY (the sidecar gets no token).
+# Turning it off returns to direct ClusterIP/pod-IP connections.
+connectionSidecar: false
+
 # -- Extra container args appended after the templated ones.
 args: []
 
