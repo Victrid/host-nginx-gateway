@@ -13,7 +13,7 @@
 # -- Controller container image.
 image:
   repository: ghcr.io/victrid/host-nginx-gateway
-  tag: "0.1.0"
+  tag: "0.2.0"
   # DaemonSet pods are pinned to specific nodes; avoid surprise upgrades.
   pullPolicy: IfNotPresent
 
