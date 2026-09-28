@@ -276,8 +276,10 @@ func TestClusterProxy_FailuresFallBackToStatic500(t *testing.T) {
 	for _, rule := range route.Rules {
 		switch rule.Locations[0] {
 		case "/web/":
-			if rule.Upstream != StaticUpstreamName(500) {
-				t.Fatalf("headless service must resolve to the static 500 marker, got %q", rule.Upstream)
+			// Headless now falls back to direct EndpointSlice resolution
+			// (pod IPs are host-reachable without a ClusterIP).
+			if rule.Upstream == StaticUpstreamName(500) {
+				t.Fatalf("headless service must fall back to direct EndpointSlice resolution")
 			}
 		case "/api/":
 			if rule.Upstream != StaticUpstreamName(500) {
@@ -289,10 +291,11 @@ func TestClusterProxy_FailuresFallBackToStatic500(t *testing.T) {
 	if parent.ResolvedRefs {
 		t.Fatalf("ref failures must surface in ResolvedRefs")
 	}
-	if parent.RefsReason != string(gatewayv1.RouteReasonUnsupportedValue) {
+	if parent.RefsReason != string(gatewayv1.RouteReasonBackendNotFound) {
 		t.Fatalf("RefsReason: got %q", parent.RefsReason)
 	}
-	// Neither broken backend contributed a mapping entry.
+	// Only the failed backend is excluded: the headless one must not have
+	// created a socket (no ClusterIP to dial), the missing one fails too.
 	if socks := g.ProxySockets(); len(socks) != 0 {
 		t.Fatalf("failed backends must not create sockets: %v", socks)
 	}

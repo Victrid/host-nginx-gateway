@@ -2315,7 +2315,16 @@ func resolveBackend(ref gatewayv1.BackendObjectReference, routeNS string,
 	// failures pass through to nginx unchanged (passive retry
 	// semantics preserved).
 	if proxySockets != nil {
-		return proxyUpstreamFor(services[ns+"/"+string(ref.Name)], ns, string(ref.Name), *ref.Port, proxySockets)
+		svc := services[ns+"/"+string(ref.Name)]
+		// Headless Services have no ClusterIP to proxy through, but their
+		// EndpointSlice pod IPs are directly reachable from the host (no
+		// ClusterIP routing involved) — fall back to the direct path
+		// instead of failing (GEP-1364: backends must be supported by
+		// Service type; the sidecar is only a ClusterIP shim).
+		if svc != nil && svc.Spec.ClusterIP == "None" {
+			return upstreamFor(slices[ns+"/"+string(ref.Name)], svc, ns, string(ref.Name), *ref.Port)
+		}
+		return proxyUpstreamFor(svc, ns, string(ref.Name), *ref.Port, proxySockets)
 	}
 
 	svcSlices := slices[ns+"/"+string(ref.Name)]
@@ -2343,8 +2352,11 @@ func proxyUpstreamFor(svc *corev1.Service, ns, name string, servicePort int32,
 			string(gatewayv1.RouteReasonUnsupportedValue), msg
 	}
 	if svc == nil {
-		return unsupported(fmt.Sprintf(
-			"Service %s/%s not found (cluster-proxy mode resolves through the Service ClusterIP; no EndpointSlice fallback)", ns, name))
+		// GEP-1364 spec reason: a backendRef to a Service that does not
+		// exist is BackendNotFound (the static-500 shape is unchanged).
+		return StaticUpstreamName(500), 500, nil,
+			string(gatewayv1.RouteReasonBackendNotFound), fmt.Sprintf(
+				"Service %s/%s not found (cluster-proxy mode resolves through the Service ClusterIP; no EndpointSlice fallback)", ns, name)
 	}
 	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
 		return unsupported(fmt.Sprintf(
