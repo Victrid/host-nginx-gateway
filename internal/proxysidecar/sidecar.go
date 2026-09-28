@@ -363,6 +363,14 @@ func (s *Sidecar) bind(name, dial string) {
 		s.log.Error(err, "bind failed (entry stays inactive; sidecar reports unhealthy)", "socket", path, "dial", dial)
 		return
 	}
+	// Unix sockets require WRITE permission to connect; net.Listen("unix")
+	// applies the process umask (typically 022 → 0755, others r-x), which
+	// would lock out the nginx worker user. Make it world-connectable.
+	if err := os.Chmod(path, 0o666); err != nil {
+		s.log.Error(err, "socket chmod failed (entry stays inactive)", "socket", path)
+		ln.Close()
+		return
+	}
 	e := &entry{name: name, dial: dial, path: path, ln: ln.(*net.UnixListener), conns: map[*connPair]struct{}{}}
 	s.mu.Lock()
 	s.entries[name] = e
