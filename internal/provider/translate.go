@@ -5,6 +5,7 @@
 package provider
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -455,6 +456,33 @@ func (g *Graph) Configuration() *contract.Configuration {
 		cfg.ExtraFiles = append(cfg.ExtraFiles, ef)
 	}
 	sort.Slice(cfg.ExtraFiles, func(a, b int) bool { return cfg.ExtraFiles[a].Path < cfg.ExtraFiles[b].Path })
+
+	// Cluster-proxy sidecar mode (DESIGN-cluster-proxy.md §0.4): the
+	// provider only builds the proxy.json CONTENT; the applier
+	// materialises it into the sockets dir (same atomic-write pattern as
+	// certs/files). Always a JSON array in sidecar mode — even an empty
+	// backend set renders "[]" so the sidecar unbinds leftovers from a
+	// previous configuration. Direct mode leaves both fields untouched
+	// (byte-identical rendering).
+	if g.proxySockets != nil {
+		type mapping struct {
+			Listen string `json:"listen"`
+			Dial   string `json:"dial"`
+		}
+		socks := g.ProxySockets()
+		mappings := make([]mapping, 0, len(socks))
+		for _, kv := range socks {
+			mappings = append(mappings, mapping{Listen: kv[0], Dial: kv[1]})
+		}
+		data, err := json.Marshal(mappings)
+		if err != nil {
+			// map[string]string marshalling cannot fail; guard anyway so
+			// the pure translate seam never silently drops the mapping.
+			panic(fmt.Sprintf("provider: marshal proxy mapping: %v", err))
+		}
+		cfg.ProxySocketsDir = g.proxyDir
+		cfg.ProxyMapping = data
+	}
 	return cfg
 }
 

@@ -62,6 +62,11 @@ type DataplaneApplier struct {
 	// ConfDir/files (DESIGN-multinode-addresses.md §5). Nil skips the
 	// step (tests without extra files).
 	Files *dataplane.FilesManager
+	// Proxy materialises the cluster-proxy mapping (proxy.json) into the
+	// shared sockets dir (DESIGN-cluster-proxy.md §0.4) when sidecar mode
+	// is on. Nil (direct mode) never touches the sockets dir — the *.sock
+	// files in it belong to the sidecar, in both modes.
+	Proxy *dataplane.ProxyMapManager
 	// Publisher renders, validates (nginx -t) and reloads.
 	Publisher *dataplane.Publisher
 	// Metrics receives the apply counters (nil-safe).
@@ -127,6 +132,20 @@ func (a *DataplaneApplier) Apply(ctx context.Context, cfg *contract.Configuratio
 		}
 	}
 
+	// 2c. Cluster-proxy mapping (DESIGN-cluster-proxy.md §3): write
+	// proxy.json BEFORE publishing — the sidecar binds new sockets from
+	// it immediately while the still-running nginx config keeps using the
+	// old sockets (nginx -t does not check unix socket existence, so
+	// there is no ordering hazard in either direction). "Cleanup" is the
+	// atomic replace itself: proxy.json is the only file the controller
+	// ever owns in that dir — the *.sock files belong to the sidecar and
+	// are never touched here.
+	if a.Proxy != nil {
+		if err := a.Proxy.Sync(cfg.ProxyMapping); err != nil {
+			return errs.Reload("syncing cluster-proxy mapping to "+a.Proxy.Dir, err)
+		}
+	}
+
 	// 3. Publish the single global configuration (cert paths absolutised,
 	// snippet placeholders substituted — a placeholder that resolves
 	// against no extra file fails HERE, before anything is written).
@@ -183,7 +202,13 @@ func (a *DataplaneApplier) withCertPaths(cfg *contract.Configuration) *contract.
 	if cfg == nil {
 		return nil
 	}
-	out := &contract.Configuration{Upstreams: cfg.Upstreams, Maps: cfg.Maps, ErrorLog: a.errorLogPath()}
+	out := &contract.Configuration{
+		Upstreams:       cfg.Upstreams,
+		Maps:            cfg.Maps,
+		SplitClients:    cfg.SplitClients,
+		ErrorLog:        a.errorLogPath(),
+		ProxySocketsDir: cfg.ProxySocketsDir, // shared upstreams carry Socket names; the renderer needs the dir
+	}
 	for _, s := range cfg.Servers {
 		if s == nil {
 			continue

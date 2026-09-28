@@ -157,6 +157,9 @@ func fmtUpstream(u *Upstream) string {
 }
 
 func fmtEndpoint(e Endpoint) string {
+	if e.Socket != "" {
+		return fmt.Sprintf("unix:%s(%s)", e.Socket, e.IP)
+	}
 	state := "up"
 	if !e.Ready {
 		state = "down"

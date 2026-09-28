@@ -3,6 +3,7 @@ package nodeaddrs
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,12 +11,13 @@ import (
 )
 
 // scriptedProbe returns a probe function serving queued results; each
-// call consumes one entry (the last repeats).
-func scriptedProbe(results ...[]string) (func(context.Context) ([]string, error), *int) {
-	calls := 0
+// call consumes one entry (the last repeats). The call counter is atomic:
+// Prober.Start probes on its own goroutine while the test goroutine reads
+// the count (fixes a pre-existing -race failure).
+func scriptedProbe(results ...[]string) (func(context.Context) ([]string, error), *int32) {
+	var calls int32
 	return func(context.Context) ([]string, error) {
-		i := calls
-		calls++
+		i := int(atomic.AddInt32(&calls, 1)) - 1
 		if i >= len(results) {
 			i = len(results) - 1
 		}
@@ -37,8 +39,8 @@ func TestProber_FirstProbeAdoptsImmediately(t *testing.T) {
 	if err := p.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if *calls != 1 {
-		t.Fatalf("calls = %d", *calls)
+	if int(atomic.LoadInt32(calls)) != 1 {
+		t.Fatalf("calls = %d", atomic.LoadInt32(calls))
 	}
 	cur := p.Current()
 	if cur == nil || !cur.Contains("192.0.2.10") {
@@ -142,7 +144,7 @@ func TestProber_StartStopsWithContext(t *testing.T) {
 			t.Fatal("Start did not tick")
 		default:
 		}
-		if *calls >= 3 {
+		if atomic.LoadInt32(calls) >= 3 {
 			cancel()
 			break
 		}

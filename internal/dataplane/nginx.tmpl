@@ -32,7 +32,11 @@ split_clients {{ .Source }} ${{ .Name }} {
 upstream {{ .Name }} {
     zone {{ .Name }} 64k;
 {{- range .Endpoints }}
+{{- if .Socket }}
+    server unix:{{ $.ProxySocketsDir }}/{{ .Socket }}{{ if .Weight }} weight={{ .Weight }}{{ end }}{{ if not .Ready }} down{{ end }};
+{{- else }}
     server {{ .IP }}:{{ .Port }}{{ if .Weight }} weight={{ .Weight }}{{ end }}{{ if not .Ready }} down{{ end }};
+{{- end }}
 {{- end }}
 }
 {{- end }}

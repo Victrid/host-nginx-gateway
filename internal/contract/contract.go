@@ -20,6 +20,23 @@ type Configuration struct {
 	// the directive.
 	ErrorLog string `json:"errorLog,omitempty"`
 
+	// ProxySocketsDir is the host directory whose unix sockets back the
+	// cluster-proxy sidecar mode (DESIGN-cluster-proxy.md): when set,
+	// endpoints carrying a Socket name render as
+	// `server unix:<ProxySocketsDir>/<Socket>;` instead of
+	// `server <IP>:<Port>;`. Empty = direct mode; the rendered bytes are
+	// identical to a configuration built without the feature.
+	ProxySocketsDir string `json:"proxySocketsDir,omitempty"`
+
+	// ProxyMapping is the materialised content of <ProxySocketsDir>/
+	// proxy.json — the single-file contract with the sidecar
+	// (DESIGN-cluster-proxy.md §3): a JSON array of
+	// {"listen":"<ns>_<svc>_<port>.sock","dial":"<clusterIP>:<port>"}
+	// entries, deterministically sorted by the producer. Non-nil ONLY in
+	// sidecar mode (even an empty backend set renders "[]"); nil means
+	// direct mode and the applier never touches the sockets dir.
+	ProxyMapping []byte `json:"proxyMapping,omitempty"`
+
 	// Maps are the nginx `map` blocks (http context) backing per-location
 	// upstream dispatch (method/header/query matching, §3.3). They are
 	// emitted before upstreams so the rendered file reads top-down. nginx
@@ -391,6 +408,15 @@ type Endpoint struct {
 	// (`weight=N`, backendRef weights §3.3). Zero/1 renders no weight
 	// directive (nginx default).
 	Weight int `json:"weight,omitempty"`
+
+	// Socket, when non-empty, switches this endpoint to the cluster-proxy
+	// sidecar form (DESIGN-cluster-proxy.md): the renderer emits
+	// `server unix:<Configuration.ProxySocketsDir>/<Socket>;` instead of
+	// the `server <IP>:<Port>` line, with weight/down preserved. The value
+	// is the socket BASENAME ("<ns>_<svc>_<port>.sock") — the sidecar
+	// binds it inside ProxySocketsDir. Empty = direct (pod IP / ClusterIP
+	// direct-dial) form, byte-identical to the pre-feature rendering.
+	Socket string `json:"socket,omitempty"`
 }
 
 func (e Endpoint) String() string {

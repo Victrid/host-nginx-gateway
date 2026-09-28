@@ -82,6 +82,12 @@ type Options struct {
 	// Default false: the annotation is ignored with a warning.
 	AllowExtraFiles bool
 
+	// ClusterProxySockets enables cluster-proxy sidecar mode
+	// (--cluster-proxy-sockets, DESIGN-cluster-proxy.md): backend
+	// resolution emits Service ClusterIPs through sidecar unix sockets in
+	// this directory. Empty = direct mode (EndpointSlice pod IPs).
+	ClusterProxySockets string
+
 	// NodeAddrs supplies this node's address fingerprint for the
 	// multinode ownership model (DESIGN-multinode-addresses.md §2). The
 	// reconciler reads Current() at every full sync; fingerprint changes
@@ -169,6 +175,7 @@ func Run(ctx context.Context, opts Options) error {
 	rec.FallbackAddresses = opts.FallbackAddresses
 	rec.AllowNginxSnippets = opts.AllowNginxSnippets
 	rec.AllowExtraFiles = opts.AllowExtraFiles
+	rec.ClusterProxySockets = opts.ClusterProxySockets
 	rec.NodeAddrs = opts.NodeAddrs
 	rec.NodeName = opts.NodeName
 	rec.Events = mgr.GetEventRecorderFor("host-nginx-gateway")
@@ -251,6 +258,10 @@ type Reconciler struct {
 	AllowNginxSnippets bool
 	AllowExtraFiles    bool
 
+	// ClusterProxySockets is the cluster-proxy sidecar mode directory
+	// (DESIGN-cluster-proxy.md); empty = direct mode. See Options.
+	ClusterProxySockets string
+
 	// NodeAddrs is this node's address fingerprint seam (nil = no
 	// fingerprint, single-node semantics). NodeName names this node in
 	// ListenerSkippedOnNode events. Events is the Gateway event recorder
@@ -302,9 +313,10 @@ func (r *Reconciler) FullSync(ctx context.Context) error {
 		return fmt.Errorf("provider: list resources: %w", err)
 	}
 	graph := BuildGraph(res, GraphOptions{
-		AllowNginxSnippets: r.AllowNginxSnippets,
-		AllowExtraFiles:    r.AllowExtraFiles,
-		NodeAddresses:      nodeAddrs,
+		AllowNginxSnippets:  r.AllowNginxSnippets,
+		AllowExtraFiles:     r.AllowExtraFiles,
+		ClusterProxySockets: r.ClusterProxySockets,
+		NodeAddresses:       nodeAddrs,
 	})
 	// BuildGraph is pure: advisories (legacy annotation deprecations,
 	// flag-gated annotations ignored, skipped extra-file refs) surface as

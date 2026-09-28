@@ -103,6 +103,19 @@ type GraphOptions struct {
 	// AllowExtraFiles enables the hng.victrid.dev/extra-files annotation.
 	AllowExtraFiles bool
 
+	// ClusterProxySockets enables cluster-proxy sidecar mode
+	// (DESIGN-cluster-proxy.md): the host's network namespace cannot be
+	// assumed to reach Service ClusterIPs (K8s spec does not guarantee
+	// it), so backend resolution emits Service ClusterIP + backendRef
+	// port through per-service unix sockets that a sidecar (running in
+	// the pod network namespace, where ClusterIPs ARE reachable) dials
+	// out to. The value is the host directory holding those sockets
+	// (e.g. /run/hng-proxy); it lands in contract.Configuration as
+	// ProxySocketsDir and every resolved endpoint carries its socket
+	// basename. Empty = direct mode (EndpointSlice pod IPs), byte-for-byte
+	// the pre-feature behavior.
+	ClusterProxySockets string
+
 	// NodeAddresses is THIS node's address fingerprint
 	// (DESIGN-multinode-addresses.md §2). It intersects every listener's
 	// spec.addresses bind intent: only the intersection is rendered and
@@ -178,6 +191,25 @@ type Graph struct {
 	// extra-file refs). BuildGraph stays pure — it records instead of
 	// logging; the reconciler turns these into controller log lines.
 	Warnings []string
+
+	// proxyDir is the cluster-proxy sockets directory (non-empty only in
+	// sidecar mode, DESIGN-cluster-proxy.md); proxySockets collects the
+	// socket basename → dial address mapping discovered during backend
+	// resolution. Configuration() serializes both into the contract.
+	proxyDir     string
+	proxySockets map[string]string
+}
+
+// ProxySockets returns the cluster-proxy mapping discovered during this
+// build (socket basename → "clusterIP:port"), sorted by socket name. Empty
+// in direct mode. Exposed for tests.
+func (g *Graph) ProxySockets() [][2]string {
+	out := make([][2]string, 0, len(g.proxySockets))
+	for k, v := range g.proxySockets {
+		out = append(out, [2]string{k, v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0] < out[j][0] })
+	return out
 }
 
 // warn records one advisory on the graph (deterministic order: the order
@@ -633,6 +665,14 @@ func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 		return a.Name < b.Name
 	})
 
+	// Cluster-proxy sidecar mode (DESIGN-cluster-proxy.md): collect the
+	// socket→dial mapping during backend resolution; nil map = direct
+	// mode and every resolution path below takes the untouched branch.
+	if opts.ClusterProxySockets != "" {
+		g.proxyDir = opts.ClusterProxySockets
+		g.proxySockets = map[string]string{}
+	}
+
 	gatewaysByKey := map[string]*GatewayInfo{}
 	for _, gw := range g.Gateways {
 		gatewaysByKey[gw.Resource.Namespace+"/"+gw.Resource.Name] = gw
@@ -643,7 +683,7 @@ func BuildGraph(res *Resources, opts GraphOptions) *Graph {
 			g.warn(fmt.Sprintf("HTTPRoute %s/%s: annotation %s is ignored (--dangerously-allow-nginx-snippets is off)",
 				r.Namespace, r.Name, LocationSnippetAnnotation))
 		}
-		resolveRoute(ri, gatewaysByKey, slicesByService, servicesByKey, namespacesByName, grantsByNamespace, opts)
+		resolveRoute(ri, gatewaysByKey, slicesByService, servicesByKey, namespacesByName, grantsByNamespace, opts, g.proxySockets)
 		g.Routes = append(g.Routes, ri)
 	}
 	return g
@@ -1543,7 +1583,7 @@ func hostnameIntersection(routeHostnames []gatewayv1.Hostname, listener *gateway
 func resolveRoute(ri *RouteInfo, gateways map[string]*GatewayInfo,
 	slices map[string][]*discoveryv1.EndpointSlice, services map[string]*corev1.Service,
 	namespaces map[string]*corev1.Namespace, grants map[string][]*gatewayv1.ReferenceGrant,
-	opts GraphOptions) {
+	opts GraphOptions, proxySockets map[string]string) {
 	route := ri.Resource
 
 	// Rules first: the route-wide backendRef resolution (GEP-1364) feeds
@@ -1553,7 +1593,7 @@ func resolveRoute(ri *RouteInfo, gateways map[string]*GatewayInfo,
 		refReason, refMsg string
 	)
 	for i := range route.Spec.Rules {
-		rule := resolveRule(i, route, slices, services, grants)
+		rule := resolveRule(i, route, slices, services, grants, opts, proxySockets)
 		ri.Rules = append(ri.Rules, rule)
 		if rule.refFailReason != "" && !refFail {
 			refFail, refReason, refMsg = true, rule.refFailReason, rule.refFailMsg
@@ -1803,7 +1843,8 @@ func routeAllowed(l *ListenerInfo, routeNS string, namespaces map[string]*corev1
 // ---------------------------------------------------------------------------
 
 func resolveRule(index int, route *gatewayv1.HTTPRoute, slices map[string][]*discoveryv1.EndpointSlice,
-	services map[string]*corev1.Service, grants map[string][]*gatewayv1.ReferenceGrant) *RuleInfo {
+	services map[string]*corev1.Service, grants map[string][]*gatewayv1.ReferenceGrant,
+	opts GraphOptions, proxySockets map[string]string) *RuleInfo {
 	rule := route.Spec.Rules[index]
 	ri := &RuleInfo{Index: index}
 
@@ -1905,7 +1946,7 @@ func resolveRule(index int, route *gatewayv1.HTTPRoute, slices map[string][]*dis
 	singleUpstream, singleEndpoints := "", []contract.Endpoint(nil)
 	for i := range active {
 		ref := active[i]
-		upstream, _, endpoints, failReason, msg := resolveBackend(ref.BackendObjectReference, route.Namespace, slices, services, grants)
+		upstream, _, endpoints, failReason, msg := resolveBackend(ref.BackendObjectReference, route.Namespace, slices, services, grants, opts, proxySockets)
 		w := int32(1)
 		if ref.Weight != nil {
 			w = *ref.Weight
@@ -1944,7 +1985,7 @@ func resolveRule(index int, route *gatewayv1.HTTPRoute, slices map[string][]*dis
 			// identical to configuring a 0.00% split — and simpler.
 			continue
 		}
-		upstream, _, endpoints, failReason, msg := resolveBackend(m.BackendRef, route.Namespace, slices, services, grants)
+		upstream, _, endpoints, failReason, msg := resolveBackend(m.BackendRef, route.Namespace, slices, services, grants, opts, proxySockets)
 		if failReason != "" {
 			if !refFail {
 				refFail, failRsn, failMsg = true, failReason, msg
@@ -2229,7 +2270,7 @@ func unsupportedRuleReason(rule gatewayv1.HTTPRouteRule) string {
 // name that disambiguates multi-port Services in the slices.
 func resolveBackend(ref gatewayv1.BackendObjectReference, routeNS string,
 	slices map[string][]*discoveryv1.EndpointSlice, services map[string]*corev1.Service,
-	grants map[string][]*gatewayv1.ReferenceGrant) (upstream string, staticCode int, endpoints []contract.Endpoint, failReason, failMsg string) {
+	grants map[string][]*gatewayv1.ReferenceGrant, opts GraphOptions, proxySockets map[string]string) (upstream string, staticCode int, endpoints []contract.Endpoint, failReason, failMsg string) {
 	static := func(reason, msg string) (string, int, []contract.Endpoint, string, string) {
 		return StaticUpstreamName(500), 500, nil, reason, msg
 	}
@@ -2267,12 +2308,78 @@ func resolveBackend(ref gatewayv1.BackendObjectReference, routeNS string,
 			"backendRef.port is required for Service references")
 	}
 
+	// Cluster-proxy sidecar mode (DESIGN-cluster-proxy.md §0.3): resolve
+	// to the Service ClusterIP + backendRef port and route through the
+	// sidecar's unix socket. The EndpointSlice path is skipped entirely —
+	// an endpoint-less Service still has a ClusterIP, and connection
+	// failures pass through to nginx unchanged (passive retry
+	// semantics preserved).
+	if proxySockets != nil {
+		return proxyUpstreamFor(services[ns+"/"+string(ref.Name)], ns, string(ref.Name), *ref.Port, proxySockets)
+	}
+
 	svcSlices := slices[ns+"/"+string(ref.Name)]
 	if len(svcSlices) == 0 {
 		return static(string(gatewayv1.RouteReasonBackendNotFound),
 			fmt.Sprintf("Service %s/%s not found (no EndpointSlices)", ns, ref.Name))
 	}
 	return upstreamFor(svcSlices, services[ns+"/"+string(ref.Name)], ns, string(ref.Name), *ref.Port)
+}
+
+// proxyUpstreamFor is the cluster-proxy-sidecar resolution path
+// (DESIGN-cluster-proxy.md §0.1/§0.3): one socket per distinct
+// service:port — "<ns>_<svc>_<port>.sock" — bound by the sidecar inside
+// the sockets dir and dialing "<clusterIP>:<servicePort>" from the pod
+// network namespace (where ClusterIP reachability is guaranteed by K8s).
+//
+// The Service object is REQUIRED here (the ClusterIP and the port's very
+// existence come from it — there is no EndpointSlice fallback), and so is
+// a routable (non-headless) ClusterIP. Failures fall back to the same
+// GEP-1364 static-500 shape as the direct path.
+func proxyUpstreamFor(svc *corev1.Service, ns, name string, servicePort int32,
+	proxySockets map[string]string) (upstream string, staticCode int, endpoints []contract.Endpoint, failReason, failMsg string) {
+	unsupported := func(msg string) (string, int, []contract.Endpoint, string, string) {
+		return StaticUpstreamName(500), 500, nil,
+			string(gatewayv1.RouteReasonUnsupportedValue), msg
+	}
+	if svc == nil {
+		return unsupported(fmt.Sprintf(
+			"Service %s/%s not found (cluster-proxy mode resolves through the Service ClusterIP; no EndpointSlice fallback)", ns, name))
+	}
+	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+		return unsupported(fmt.Sprintf(
+			"Service %s/%s has no ClusterIP (headless); not routable in cluster-proxy mode", ns, name))
+	}
+	found := false
+	for _, p := range svc.Spec.Ports {
+		if p.Port == servicePort {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return unsupported(fmt.Sprintf("Service %s/%s has no port %d", ns, name, servicePort))
+	}
+
+	socket := fmt.Sprintf("%s_%s_%d.sock", ns, name, servicePort)
+	dial := net.JoinHostPort(svc.Spec.ClusterIP, strconv.Itoa(int(servicePort)))
+	// Idempotent: every rule referencing the same service:port lands on
+	// the same socket; the mapping is serialized deterministically.
+	proxySockets[socket] = dial
+
+	upstream = fmt.Sprintf("%s_%s_%d", ns, name, servicePort)
+	// One endpoint: the socket itself. IP/Port carry the dial target for
+	// diagnostics; the renderer uses Socket when non-empty. Ready is
+	// always true — service liveness is the sidecar's connect-time
+	// concern (§0: connection failures pass through to nginx, passive
+	// retry semantics preserved).
+	endpoints = []contract.Endpoint{{
+		IP:     svc.Spec.ClusterIP,
+		Port:   int(servicePort),
+		Ready:  true,
+		Socket: socket,
+	}}
+	return upstream, 0, endpoints, "", ""
 }
 
 // upstreamFor derives the upstream name and endpoints from a service's
