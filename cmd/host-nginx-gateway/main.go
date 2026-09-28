@@ -34,6 +34,8 @@ import (
 	"github.com/Victrid/HostNginxGateway/internal/dataplane"
 	"github.com/Victrid/HostNginxGateway/internal/nodeaddrs"
 	"github.com/Victrid/HostNginxGateway/internal/provider"
+	"github.com/Victrid/HostNginxGateway/internal/proxysidecar"
+	"github.com/Victrid/HostNginxGateway/internal/reachability"
 )
 
 // nginxPrefix/nginxMainConfig locate the user's main nginx config for the
@@ -48,24 +50,35 @@ const (
 // config carries the parsed flag values; a struct (instead of main-locals)
 // keeps run() testable.
 type config struct {
-	nginxConfDir       string
-	nginxBinary        string
-	nginxPID           string
-	healthzAddr        string
-	publishAddresses   string
-	nginxErrorLog      string
-	allowNginxSnippets bool
-	allowExtraFiles    bool
+	nginxConfDir        string
+	nginxBinary         string
+	nginxPID            string
+	healthzAddr         string
+	publishAddresses    string
+	nginxErrorLog       string
+	allowNginxSnippets  bool
+	allowExtraFiles     bool
+	clusterProxySockets string
 }
 
 func main() {
-	// Hidden probe path (internal/nodeaddrs): re-executed by the prober
-	// through `nsenter -t 1 -n -- <self>` to enumerate the HOST network
-	// namespace's addresses (the pod's own interfaces are the pod
-	// network, not the node's). Handled before flag parsing; prints one
-	// address per line and exits.
-	if len(os.Args) > 1 && os.Args[1] == nodeaddrs.PrintAddressesFlag {
+	// Hidden probe paths (internal/nodeaddrs, internal/reachability):
+	// re-executed by the probers through `nsenter -t 1 -n -- <self>` to
+	// observe the HOST network namespace from the pod (the pod's own
+	// interfaces are the pod network, not the node's). Handled before
+	// flag parsing; each prints its answer and exits.
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == nodeaddrs.PrintAddressesFlag:
 		printNodeAddresses()
+		return
+	case len(os.Args) > 1 && os.Args[1] == reachability.ProbeFlag:
+		if err := reachability.Child(); err != nil {
+			fmt.Fprintln(os.Stderr, "host-nginx-gateway:", err)
+			os.Exit(1)
+		}
+		return
+	case len(os.Args) > 1 && os.Args[1] == "cluster-proxy-sidecar":
+		runClusterProxySidecar(os.Args[2:])
 		return
 	}
 
@@ -118,6 +131,15 @@ func main() {
 			"materialised under <nginx-conf-dir>/files/ and referenceable "+
 			"from snippets via @<key>@ placeholders. Annotation writers "+
 			"must be trusted at cluster-admin level.")
+	fs.StringVar(&cfg.clusterProxySockets, "cluster-proxy-sockets", "",
+		"Enable cluster-proxy sidecar mode (DESIGN-cluster-proxy.md) with "+
+			"this host directory as the shared socket dir (chart: /run/hng-"+
+			"proxy, mounted into both containers). Backend resolution emits "+
+			"Service ClusterIPs through <dir>/<ns>_<svc>_<port>.sock unix "+
+			"sockets rendered as `server unix:...` upstream lines; the "+
+			"mapping lands in <dir>/proxy.json for the sidecar. Use when "+
+			"the host network namespace cannot reach ClusterIPs. Empty "+
+			"(default) = direct mode, byte-identical legacy behavior.")
 	_ = fs.Parse(os.Args[1:])
 
 	switch {
@@ -143,7 +165,8 @@ func main() {
 		"nginx-main-config", nginxMainConfig,
 		"nginx-error-log", cfg.nginxErrorLog,
 		"dangerously-allow-nginx-snippets", cfg.allowNginxSnippets,
-		"dangerously-allow-extra-files", cfg.allowExtraFiles)
+		"dangerously-allow-extra-files", cfg.allowExtraFiles,
+		"cluster-proxy-sockets", cfg.clusterProxySockets)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -223,11 +246,22 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 	certs := dataplane.NewCertsManager(filepath.Join(cfg.nginxConfDir, "certs"))
 	files := dataplane.NewFilesManager(cfg.nginxConfDir)
 
+	// Cluster-proxy sidecar mode (DESIGN-cluster-proxy.md): materialise
+	// proxy.json into the shared sockets dir BEFORE publishing the
+	// referencing config (same ordering contract as certs/files; the
+	// sidecar unbinds leftovers when the mapping shrinks to "[]"). The
+	// manager is nil in direct mode — the sockets dir is never touched.
+	var proxyMap *dataplane.ProxyMapManager
+	if cfg.clusterProxySockets != "" {
+		proxyMap = dataplane.NewProxyMapManager(cfg.clusterProxySockets)
+	}
+
 	applier := &DataplaneApplier{
 		ConfDir:      cfg.nginxConfDir,
 		Nginx:        nginx,
 		Certs:        certs,
 		Files:        files,
+		Proxy:        proxyMap,
 		Publisher:    publisher,
 		Metrics:      metrics,
 		Log:          logger.WithName("dataplane"),
@@ -254,6 +288,32 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		logger.Error(err, "initial node address probe failed — running without a fingerprint (single-node semantics); retrying periodically")
 	}
 
+	// 3b. ClusterIP reachability probe (DESIGN-cluster-proxy.md §5/§0.11,
+	// informational only): dial the apiserver Service address from the
+	// HOST network namespace via the same nsenter self re-exec the
+	// nodeaddrs prober uses. Unreachable + sidecar mode off → warning
+	// with enablement guidance; reachable → informational note; probe
+	// machinery failure → "unknown" (never treated as unreachable). No
+	// behavior change either way, no status conditions.
+	if cfg.clusterProxySockets == "" {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		reachable, err := reachability.CommandProbe(probeCtx, 1, self)
+		cancel()
+		switch {
+		case err != nil:
+			logger.Info("ClusterIP reachability probe could not run (treating as unknown)",
+				"reason", err.Error())
+		case reachable:
+			logger.Info("host network namespace can reach ClusterIPs (probed the apiserver Service); direct backend connections in use")
+		default:
+			logger.Info(
+				"WARNING: the host network namespace cannot reach ClusterIPs (probed the apiserver Service from the host netns). " +
+					"If Gateways report healthy but backends are unreachable, deploy with the connection sidecar: " +
+					"set connectionSidecar=true in the chart (it injects the hng-sidecar container and adds --cluster-proxy-sockets=/run/hng-proxy). " +
+					"See README.md \"ClusterIP reachability and the connection sidecar\".")
+		}
+	}
+
 	// 4. Provider manager (watches, full reconcile, status write-back).
 	// Connects with the in-cluster ServiceAccount (no kubeconfig flag —
 	// the DaemonSet pod's projected token is the only credential).
@@ -265,6 +325,7 @@ func run(ctx context.Context, cfg config, logger logr.Logger) error {
 		FallbackAddresses:      detectPublishAddresses(),
 		AllowNginxSnippets:     cfg.allowNginxSnippets,
 		AllowExtraFiles:        cfg.allowExtraFiles,
+		ClusterProxySockets:    cfg.clusterProxySockets,
 		NodeAddrs:              nodeProber,
 		NodeName:               nodeName(),
 		OnListenersSkipped:     metrics.AddSkippedListeners,
@@ -334,4 +395,46 @@ func printNodeAddresses() {
 func fatal(msg string) {
 	fmt.Fprintln(os.Stderr, "host-nginx-gateway: "+msg)
 	os.Exit(2)
+}
+
+// runClusterProxySidecar implements the `cluster-proxy-sidecar`
+// subcommand (DESIGN-cluster-proxy.md §0.10): the same binary, a
+// different entrypoint. The sidecar has zero Kubernetes dependencies —
+// it executes the proxy.json mapping contract and nothing else.
+func runClusterProxySidecar(args []string) {
+	fs := flag.NewFlagSet("cluster-proxy-sidecar", flag.ExitOnError)
+	fs.SetOutput(os.Stderr)
+	var socketsDir, healthzAddr string
+	fs.StringVar(&socketsDir, "sockets-dir", "/run/hng-proxy",
+		"Shared hostPath directory holding proxy.json and the *.sock files the sidecar binds.")
+	fs.StringVar(&healthzAddr, "healthz-addr", "127.0.0.1:9126",
+		"Address the /healthz readiness endpoint listens on (must not overlap the controller's healthz port).")
+	_ = fs.Parse(args)
+
+	switch {
+	case socketsDir == "":
+		fatal("cluster-proxy-sidecar: --sockets-dir must not be empty")
+	case healthzAddr == "":
+		fatal("cluster-proxy-sidecar: --healthz-addr must not be empty")
+	}
+
+	logger := zap.New()
+	log.SetLogger(logger)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	sc, err := proxysidecar.New(proxysidecar.Options{
+		SocketsDir:  socketsDir,
+		HealthzAddr: healthzAddr,
+		Log:         logger.WithName("cluster-proxy-sidecar"),
+	})
+	if err != nil {
+		logger.Error(err, "cluster-proxy-sidecar startup failed")
+		os.Exit(1)
+	}
+	if err := sc.Run(ctx); err != nil {
+		logger.Error(err, "cluster-proxy-sidecar exited with error")
+		os.Exit(1)
+	}
+	logger.Info("cluster-proxy-sidecar stopped")
 }
