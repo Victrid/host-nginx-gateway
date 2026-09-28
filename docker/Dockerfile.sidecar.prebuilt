@@ -1,0 +1,14 @@
+# Prebuilt variant of docker/Dockerfile.sidecar for no-network /
+# no-registry environments (used by e2e/run-conformance.sh with SIDECAR=true):
+# the binary is built on the host (warm module cache) and only the runtime
+# layer is assembled here. Identical runtime to the canonical multi-stage
+# sidecar build — bare alpine + the static binary. No nsenter, no
+# ca-certificates (the sidecar never execs into the host nor talks TLS);
+# readiness wget comes from busybox.
+#
+#   CGO_ENABLED=0 go build -o build/host-nginx-gateway ./cmd/host-nginx-gateway
+#   docker build -f docker/Dockerfile.sidecar.prebuilt \
+#     -t ghcr.io/victrid/hng-sidecar:v0 docker/   # context must contain the binary
+FROM alpine:3.22
+COPY host-nginx-gateway /usr/local/bin/host-nginx-gateway
+ENTRYPOINT ["/usr/local/bin/host-nginx-gateway", "cluster-proxy-sidecar"]

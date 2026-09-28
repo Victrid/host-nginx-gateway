@@ -58,6 +58,11 @@ set -u -o pipefail
 FIXTURE_CONF=/etc/nginx/conf.d/k8s-gw-default-fixture.conf
 FIXTURE_CERT=/etc/nginx/conf.d/k8s-gw-default-fixture.pem
 FIXTURE_KEY=/etc/nginx/conf.d/k8s-gw-default-fixture.key
+# Fixture-OWNED copy of the suite cert: the controller's certs/ orphan
+# cleanup deletes any pem not in the current desired set, so referencing
+# SUITE_CERT directly dangles the fixture the moment a sync drops it
+# (observed: mass nginx -t failures mid-run). Copy once, reference the copy.
+FIXTURE_SUITE_CERT=/etc/nginx/conf.d/k8s-gw-default-fixture-suite.pem
 FIXTURE_INCLUDE='include /etc/nginx/conf.d/k8s-gw-default-fixture.conf;'
 MAIN_CONF=/etc/nginx/nginx.conf
 SUITE_CERT=/etc/nginx/conf.d/k8s-gw/certs/gateway-conformance-infra_tls-validity-checks-certificate.pem
@@ -112,10 +117,12 @@ if [ "$WAIT_SUITE_CERT" = 1 ]; then
 fi
 # The suite cert is the controller-materialized combined PEM (cert+key in
 # ONE file — the template renders ssl_certificate and ssl_certificate_key
-# with the same path), so both directives point at it.
+# with the same path), so both directives point at the fixture-owned COPY.
 if [ -f "$SUITE_CERT" ]; then
-  TLS_CERT=$SUITE_CERT
-  TLS_KEY=$SUITE_CERT
+  cp -f "$SUITE_CERT" "$FIXTURE_SUITE_CERT"
+  chmod 644 "$FIXTURE_SUITE_CERT"
+  TLS_CERT=$FIXTURE_SUITE_CERT
+  TLS_KEY=$FIXTURE_SUITE_CERT
 fi
 
 if [ ! -f "$FIXTURE_CERT" ] || [ ! -f "$FIXTURE_KEY" ]; then

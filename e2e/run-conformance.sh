@@ -36,6 +36,11 @@ RELEASE=hng-conf
 CHART_NS=kube-system
 IMG=localhost/hng-e2e/controller
 IMG_TAG=v1
+# SIDECAR=true — exercise the cluster-proxy connection sidecar path
+# (DESIGN-cluster-proxy.md): builds + imports a local hng-sidecar image
+# (same binary, different ENTRYPOINT) and installs the chart with
+# connectionSidecar=true, so every backend upstream is a unix socket.
+SIDECAR=${SIDECAR:-false}
 NS_PREFIX=gateway-conformance
 GWCLASS=host-nginx
 CONTROLLER=gateway.host-nginx/controller
@@ -119,7 +124,7 @@ DS_NAME() { kubectl -n "$CHART_NS" get ds -l app.kubernetes.io/instance="$RELEAS
 
 ctr_image_present() { # REF — k3s ctr list can lag well over 30s right after import
   wait_until "image $1 in containerd" 120 \
-    "k3s ctr images list 2>/dev/null | grep -q \"^\\$1 \""
+    "k3s ctr images list 2>/dev/null | grep -c \"^\\$1 \" >/dev/null"
 }
 
 teardown() {
@@ -203,7 +208,7 @@ ok "default-server fixture installed (80/443 wildcard + loopback pool)"
 # ---------------------------------------------------------------------------
 log "suite backend images (docker pull + k3s ctr import)"
 for image in "${SUITE_IMAGES[@]}"; do
-  if k3s ctr images list 2>/dev/null | grep -q "^$image "; then
+  if [ "$(k3s ctr images list 2>/dev/null | grep -c "^$image ")" -gt 0 ]; then
     echo "    $image already in containerd"
     continue
   fi
@@ -234,7 +239,8 @@ timeout 420 docker build -q --network=host -f "$REPO_ROOT/docker/Dockerfile.cont
   -t "$IMG:$IMG_TAG" "$REPO_ROOT/docker" >/dev/null || die "image build failed"
 rm -f "$REPO_ROOT/docker/host-nginx-gateway"
 rm -f /tmp/opencode/hng-controller.tar
-docker save -o /tmp/opencode/hng-controller.tar "$IMG:$IMG_TAG" \
+rm -f /tmp/opencode/hng-controller.tar
+docker save --format oci-archive -o /tmp/opencode/hng-controller.tar "$IMG:$IMG_TAG" \
   || die "docker save failed"
 # Import + verify with retries: when the tar carries NEW content (fresh
 # binary), containerd's image-metadata view can lag the import for minutes
@@ -244,8 +250,8 @@ docker save -o /tmp/opencode/hng-controller.tar "$IMG:$IMG_TAG" \
 import_ok=false
 for attempt in 1 2 3; do
   k3s ctr images remove "$IMG:$IMG_TAG" >/dev/null 2>&1 || true
-  k3s ctr images import --local /tmp/opencode/hng-controller.tar >/dev/null 2>&1 \
-    || sudo k3s ctr images import --local /tmp/opencode/hng-controller.tar >/dev/null \
+  k3s ctr images import --all-platforms /tmp/opencode/hng-controller.tar >/dev/null 2>&1 \
+    || sudo k3s ctr images import --all-platforms /tmp/opencode/hng-controller.tar >/dev/null \
     || { sleep 5; continue; }
   if ctr_image_present "$IMG:$IMG_TAG"; then import_ok=true; break; fi
   sleep 5
@@ -254,11 +260,39 @@ done
 ok "image $IMG:$IMG_TAG built and imported"
 
 # ---------------------------------------------------------------------------
+SIDECAR_SET=()
+if [ "$SIDECAR" = true ]; then
+  log "build + import sidecar image (same binary, cluster-proxy-sidecar ENTRYPOINT)"
+  SIDECAR_IMG=ghcr.io/victrid/hng-sidecar
+  cp /tmp/opencode/hng-controller-bin "$REPO_ROOT/docker/host-nginx-gateway"
+  timeout 420 docker build -q --network=host -f "$REPO_ROOT/docker/Dockerfile.sidecar.prebuilt" \
+    -t "$SIDECAR_IMG:$IMG_TAG" "$REPO_ROOT/docker" >/dev/null || die "sidecar image build failed"
+  rm -f "$REPO_ROOT/docker/host-nginx-gateway"
+  rm -f /tmp/opencode/hng-sidecar.tar
+  rm -f /tmp/opencode/hng-sidecar.tar
+docker save --format oci-archive -o /tmp/opencode/hng-sidecar.tar "$SIDECAR_IMG:$IMG_TAG" \
+    || die "sidecar docker save failed"
+  import_ok=false
+  for attempt in 1 2 3; do
+    k3s ctr images remove "$SIDECAR_IMG:$IMG_TAG" >/dev/null 2>&1 || true
+    k3s ctr images import --all-platforms /tmp/opencode/hng-sidecar.tar >/dev/null 2>&1 \
+      || sudo k3s ctr images import --all-platforms /tmp/opencode/hng-sidecar.tar >/dev/null \
+      || { sleep 5; continue; }
+    if ctr_image_present "$SIDECAR_IMG:$IMG_TAG"; then import_ok=true; break; fi
+    sleep 5
+  done
+  [ "$import_ok" = true ] || die "sidecar ctr import verification failed (3 attempts)"
+  ok "sidecar image $SIDECAR_IMG:$IMG_TAG built and imported"
+  SIDECAR_SET=(--set connectionSidecar=true)
+fi
+
+# ---------------------------------------------------------------------------
 log "helm install (DaemonSet form)"
 kubectl delete gatewayclass "$GWCLASS" --ignore-not-found >/dev/null 2>&1
 "$HELM" upgrade --install "$RELEASE" "$REPO_ROOT/charts/host-nginx-gateway" \
   --namespace "$CHART_NS" \
   --set image.repository="$IMG" --set image.tag="$IMG_TAG" --set image.pullPolicy=Never \
+  ${SIDECAR_SET+"${SIDECAR_SET[@]}"} \
   >/dev/null || { teardown; die "helm install failed"; }
 wait_until "DaemonSet rollout" 180 "KN rollout status daemonset/\$(DS_NAME) --timeout=5s" \
   || { KN get pods -l app.kubernetes.io/instance=$RELEASE; teardown; die "DaemonSet not Ready"; }
@@ -266,6 +300,21 @@ POD=$(KN get pods -l app.kubernetes.io/instance=$RELEASE -o name | head -1 | cut
 KN logs "$POD" 2>/dev/null | grep -q '"mode":"nsenter"' \
   && ok "DaemonSet pod Ready, exec mode nsenter ($POD)" \
   || bad "DaemonSet pod Ready but exec mode not nsenter ($POD)"
+if [ "$SIDECAR" = true ]; then
+  wait_until "sidecar container Ready" 120 \
+    "KN get pod \$POD -o jsonpath='{.status.containerStatuses[?(@.name==\"cluster-proxy-sidecar\")].ready}' | grep -q true" \
+    || { \
+         echo "    --- sidecar debug dump ---" >&2; \
+         KN get pod "$POD" -o wide >&2; \
+         KN get pod "$POD" -o jsonpath='{.containerStatuses}' >&2; echo >&2; \
+         echo "    [controller tail]" >&2; KN logs "$POD" -c controller --tail=30 >&2; \
+         echo "    [sidecar tail]" >&2; KN logs "$POD" -c cluster-proxy-sidecar --tail=30 >&2; \
+         echo "    [proxy.json via controller]" >&2; KN exec "$POD" -c controller -- cat /run/hng-proxy/proxy.json >&2; echo >&2; \
+         echo "    [dir via sidecar]" >&2; KN exec "$POD" -c cluster-proxy-sidecar -- ls -la /run/hng-proxy >&2; \
+         echo "    [healthz via sidecar]" >&2; KN exec "$POD" -c cluster-proxy-sidecar -- wget -q -O - http://127.0.0.1:9126/healthz >&2; echo >&2; \
+         teardown; die "sidecar not Ready"; }
+  ok "sidecar container Ready (connectionSidecar=true)"
+fi
 wait_until "GatewayClass $GWCLASS Accepted" 90 \
   "K get gatewayclass $GWCLASS -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].status}' | grep -q True" \
   || { K get gatewayclass "$GWCLASS" -o yaml; teardown; die "GatewayClass not Accepted"; }

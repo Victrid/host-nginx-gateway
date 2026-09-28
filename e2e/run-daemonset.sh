@@ -172,16 +172,32 @@ timeout 420 docker build -q --network=host -f "$REPO_ROOT/docker/Dockerfile.cont
   -t "$IMG:$IMG_TAG" "$REPO_ROOT/docker" >/dev/null || die "image build failed (network? adjust APK_MIRROR)"
 rm -f "$REPO_ROOT/docker/host-nginx-gateway"
 rm -f /tmp/opencode/hng-controller.tar
-docker save -o /tmp/opencode/hng-controller.tar "$IMG:$IMG_TAG" \
-  || die "docker save failed (podman cannot modify an existing archive)"
-# ctr refuses to re-import over an existing tag with different content
-# ("docker-archive doesn't support modifying existing images") — drop it first
+docker save --format oci-archive -o /tmp/opencode/hng-controller.tar "$IMG:$IMG_TAG" \
+  || die "docker save failed"
+# drop the old tag first: ctr re-imports over an existing tag can silently
+# no-op (import reports 0 B and the old manifest stays in place)
 k3s ctr images remove "$IMG:$IMG_TAG" >/dev/null 2>&1 || true
-k3s ctr images import --local /tmp/opencode/hng-controller.tar >/dev/null 2>&1 \
-  || sudo k3s ctr images import --local /tmp/opencode/hng-controller.tar >/dev/null \
-  || die "ctr import failed"
-k3s ctr images list 2>/dev/null | grep -q "^$IMG:$IMG_TAG" \
-  || die "ctr import verification failed ($IMG:$IMG_TAG not in containerd)"
+# Import + verify with retries: containerd's image-metadata view can lag
+# the import for well over a minute (see run-conformance.sh, round 4 note).
+import_ok=false
+for attempt in 1 2 3; do
+  k3s ctr images import --all-platforms /tmp/opencode/hng-controller.tar >/dev/null 2>&1 \
+    || sudo k3s ctr images import --all-platforms /tmp/opencode/hng-controller.tar >/dev/null \
+    || { sleep 5; continue; }
+  echo "  DEBUG attempt=$attempt tags: $(k3s ctr images list -q 2>&1 | grep -i controller | tr '\n' '|')" >&2
+  echo "  DEBUG4 grep-rc: $(k3s ctr images list 2>/dev/null | grep -c '^localhost/hng-e2e/controller:v1') pattern=^$IMG:$IMG_TAG" >&2
+  if [ "$(k3s ctr images list 2>/dev/null | grep -c "^$IMG:$IMG_TAG")" -gt 0 ]; then import_ok=true; break; fi
+  # oci-archive imports can land under a mangled ref name (observed: a
+  # space replacing a dash) — re-tag whatever matches the basename.
+  bad=$(k3s ctr images list -q 2>/dev/null | grep "controller:$IMG_TAG" | grep -v "^$IMG:$IMG_TAG$" | head -1)
+  if [ -n "$bad" ]; then
+    k3s ctr images tag "$bad" "$IMG:$IMG_TAG" >/dev/null 2>&1 \
+      || sudo k3s ctr images tag "$bad" "$IMG:$IMG_TAG" >/dev/null 2>&1
+  fi
+  if [ "$(k3s ctr images list 2>/dev/null | grep -c "^$IMG:$IMG_TAG")" -gt 0 ]; then import_ok=true; break; fi
+  sleep 5
+done
+[ "$import_ok" = true ] || die "ctr import verification failed ($IMG:$IMG_TAG not in containerd)"
 ok "image $IMG:$IMG_TAG built and imported"
 
 # ---------------------------------------------------------------------------
